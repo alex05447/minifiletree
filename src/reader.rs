@@ -396,7 +396,7 @@ impl<'a> FileTreeReader<'a> {
 
     /// Calculates the offset in bytes from the start of the file tree data blob to the array of path parts.
     fn path_parts_offset(lookup_len: u32) -> u32 {
-        let mut offset = Self::lookup_keys_offset() + Self::lookup_values_offset(lookup_len);
+        let mut offset = Self::lookup_values_offset(lookup_len) + lookup_len * size_of::<PathPartIndex>() as u32;
         // Must be aligned to 8 bytes.
         offset += offset % 8;
         offset

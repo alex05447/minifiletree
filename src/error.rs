@@ -7,7 +7,7 @@ use std::{
 /// An error returned by the [`file tree writer`].
 ///
 /// [`file tree writer`]: struct.FileTreeWriter.html
-#[derive(Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum FileTreeWriterError {
     /// Empty paths are not allowed.
     EmptyPath,

@@ -616,19 +616,14 @@ impl<'a> Iterator for PathIter<'a> {
 mod tests {
     use {super::*, seahash::SeaHasher};
 
-    struct BuildSeaHasher(SeaHasher);
-
-    impl Default for BuildSeaHasher {
-        fn default() -> Self {
-            Self(SeaHasher::default())
-        }
-    }
+    #[derive(Default)]
+    struct BuildSeaHasher;
 
     impl BuildHasher for BuildSeaHasher {
         type Hasher = SeaHasher;
 
         fn build_hasher(&self) -> Self::Hasher {
-            self.0
+            SeaHasher::new()
         }
     }
 

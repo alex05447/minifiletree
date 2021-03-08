@@ -24,7 +24,7 @@ use {
 /// [`Hasher`]: std::hash::Hasher
 pub type PathHash = u64;
 
-pub(crate) type PathPartIndex = u32;
+type PathPartIndex = u32;
 type StringIndex = u32;
 type StringOffset = u32;
 type StringLength = u32;
