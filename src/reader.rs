@@ -106,12 +106,7 @@ impl<'a> FileTreeReader<'a> {
             return false;
         }
 
-        // Must have at least as many (or more) string table entries as there are lookup entries.
         let string_table_len = header.string_table_len();
-
-        if string_table_len < lookup_len {
-            return false;
-        }
 
         // Must be large enough to accomodate the section lengths from the header.
         if data.len() < Self::required_size(lookup_len, path_parts_len, string_table_len) {
