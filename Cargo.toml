@@ -6,5 +6,17 @@ edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = []
+# Just for testing of correct endianness handling of serialized data.
+# LE used by default for writing and reading. Obviously data serialized with BE will be incompatible with LE readers.
+big_endian = []
+
+[dependencies]
+static_assertions = "1.1.*"
+ministr = { path = "../ministr" }
+minifilepath = { path = "../minifilepath" }
+
 [dev-dependencies]
 seahash = { version = "4.1" }
+minifilepath_macro = { path = "../minifilepath_macro" }

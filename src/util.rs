@@ -1,44 +1,62 @@
-use std::{
-    collections::{hash_map::Entry, HashMap},
-    hash::Hash,
-    iter::Iterator,
-    mem::size_of,
-    slice::from_ref,
+use {
+    crate::FullStringLength,
+    minifilepath::FilePathComponent,
+    std::{
+        collections::{hash_map::Entry, HashMap},
+        hash::Hash,
+        mem, slice,
+    },
 };
 
-pub(crate) fn to_lower_str(string: &str, result: &mut String) {
-    for c in string.chars() {
-        to_lower_char(c, result);
+pub(crate) fn u16_to_bin_bytes(val: u16) -> [u8; 2] {
+    if cfg!(feature = "big_endian") {
+        u16::to_be_bytes(val)
+    } else {
+        u16::to_le_bytes(val)
     }
 }
 
-pub(crate) fn to_lower_char(c: char, result: &mut String) {
-    for c in c.to_lowercase() {
-        result.push(c);
+pub(crate) fn u16_from_bin(bin: u16) -> u16 {
+    if cfg!(feature = "big_endian") {
+        u16::from_be(bin)
+    } else {
+        u16::from_le(bin)
     }
 }
 
 pub(crate) fn u32_to_bin_bytes(val: u32) -> [u8; 4] {
-    u32::to_le_bytes(val)
-    //u32::to_be_bytes(val)
+    if cfg!(feature = "big_endian") {
+        u32::to_be_bytes(val)
+    } else {
+        u32::to_le_bytes(val)
+    }
 }
 
 pub(crate) fn u32_from_bin(bin: u32) -> u32 {
-    u32::from_le(bin)
-    //u32::from_be(bin)
+    if cfg!(feature = "big_endian") {
+        u32::from_be(bin)
+    } else {
+        u32::from_le(bin)
+    }
 }
 
-pub(crate) fn u64_to_bin_bytes(val: u64) -> [u8; size_of::<u64>()] {
-    u64::to_le_bytes(val)
-    //u32::to_be_bytes(val)
+pub(crate) fn u64_to_bin_bytes(val: u64) -> [u8; mem::size_of::<u64>()] {
+    if cfg!(feature = "big_endian") {
+        u64::to_be_bytes(val)
+    } else {
+        u64::to_le_bytes(val)
+    }
 }
 
 pub(crate) fn u64_from_bin(bin: u64) -> u64 {
-    u64::from_le(bin)
-    //u64::from_be(bin)
+    if cfg!(feature = "big_endian") {
+        u64::from_be(bin)
+    } else {
+        u64::from_le(bin)
+    }
 }
 
-/// One or multiple value in the multimap associated with a given key.
+/// One or multiple values in the multimap associated with a given key.
 enum OneOrMultiple<T> {
     /// Usual case - one value associated with a key.
     One(T),
@@ -80,25 +98,27 @@ impl<K: Eq + Hash, V: Eq + Copy> MultiMap<K, V> {
 
     pub(crate) fn get(&self, key: &K) -> Option<&[V]> {
         self.0.get(&key).map(|entry| match entry {
-            OneOrMultiple::One(value) => from_ref(value),
-            OneOrMultiple::Multiple(values) => &values[..],
+            OneOrMultiple::One(value) => slice::from_ref(value),
+            OneOrMultiple::Multiple(values) => values,
         })
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.0.clear()
     }
 }
 
-/// Takes a (reverse) iterator builder `iter` over path parts / components,
+/// Takes a (non-empty, reverse) iterator builder `iter` over path components,
 /// clears and fills the `string` with the full path, using `/` as separators.
-pub(crate) fn build_path_string<'i, F, I>(iter: F, string: &mut String)
+///
+/// The caller guarantees the string built from the iterator (including the separators) is actually going to be `len` bytes long.
+pub(crate) fn build_path_string<'i, F, I>(iter: F, len: FullStringLength, string: &mut String)
 where
     F: Fn() -> I,
-    I: Iterator<Item = &'i str>,
+    I: ExactSizeIterator<Item = FilePathComponent<'i>>,
 {
-    let (num_parts, len) = iter().fold((0, 0), |(num_parts, len), part| {
-        (num_parts + 1, len + part.len())
-    });
-    debug_assert!(num_parts > 0);
-
-    let len = len + num_parts - 1;
+    let iter = iter();
+    let num_components = iter.len();
 
     string.clear();
     string.reserve(len as _);
@@ -111,17 +131,20 @@ where
 
     let mut offset = len;
 
-    for (idx, part) in iter().enumerate() {
-        let first = idx == (num_parts - 1);
+    for (idx, component) in iter.enumerate() {
+        let first = idx == (num_components - 1);
 
-        debug_assert!(offset >= part.len());
-        offset -= part.len();
+        debug_assert!(
+            offset >= component.len() as _,
+            "provided and calculated string lengths mismatch"
+        );
+        offset -= component.len() as FullStringLength;
 
         unsafe {
             std::ptr::copy_nonoverlapping(
-                part.as_ptr(),
+                component.as_ptr(),
                 string.as_mut_ptr().offset(offset as _),
-                part.len(),
+                component.len(),
             )
         };
 
@@ -129,7 +152,7 @@ where
             debug_assert!(offset >= 1);
             offset -= 1;
 
-            *(unsafe { string.get_unchecked_mut(offset) }) = b'/';
+            *(unsafe { string.get_unchecked_mut(offset as usize) }) = b'/';
         }
     }
 
@@ -141,5 +164,13 @@ pub(crate) fn debug_unreachable() -> ! {
         unreachable!()
     } else {
         unsafe { std::hint::unreachable_unchecked() }
+    }
+}
+
+pub(crate) unsafe fn debug_unwrap<T>(val: Option<T>) -> T {
+    if let Some(val) = val {
+        val
+    } else {
+        debug_unreachable()
     }
 }

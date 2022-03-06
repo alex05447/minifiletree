@@ -1,286 +1,250 @@
 use {
-    crate::{
-        error::*, util::*, FileTreeHeader, InternedString, PathHash, PathPart, PathPartIndex,
-        StringIndex,
-    },
+    crate::*,
+    minifilepath::{FilePath, FilePathBuf, FilePathComponent},
+    ministr::NonEmptyStr,
     std::{
         collections::HashMap,
         hash::{BuildHasher, Hasher},
         io::{self, Write},
-        iter::Iterator,
+        iter::{ExactSizeIterator, Iterator},
         mem::size_of,
-        num::NonZeroU32,
-        path::{Component, Path, PathBuf},
     },
 };
 
+/// Here the `PathHash` key is the accumulated hash of the entire subpath so far.
+type SubpathLookup = MultiMap<PathHash, PathComponentIndex>;
+/// Here the `PathHash` key is the hash of just a single path component.
 type StringLookup = MultiMap<PathHash, StringIndex>;
-type SubpathLookup = MultiMap<PathHash, PathPartIndex>;
 
-/// Provides an API to append hashed file paths to a buffer and store them space-efficiently.
-/// Deduplicates unique path part / component strings and file tree nodes.
-/// When finished, writes the data to a binary blob which may then be saved, read by a [`reader`] and used to lookup the full file paths by their hashes.
+#[derive(Clone, Copy)]
+struct PathComponentAndMetadata {
+    path_component: PathComponent,
+    /// See `LeafPathComponent::num_components`.
+    num_components: NumComponents,
+    /// See `LeafPathComponent::string_len` (but for the path starting at the `path_component`).
+    string_len: FullStringLength,
+}
+
+/// Provides an API to append [`hashed`](PathHash) [`file paths`](FilePath) to a buffer and store them space-efficiently.
+/// Deduplicates unique [`path component`](FilePathComponent) strings and file tree nodes.
 ///
-/// Uses a user-provided [`hasher builder`] to hash the path parts / components.
+/// When finished, [`writes`](FileTreeWriter::write) the data to a binary blob which may then be saved, read by a [`FileTreeReader`]
+/// and used to lookup the full file paths by their hashes.
 ///
-/// [`reader`]: struct.FileTreeReader.html
-/// [`hasher builder`]: std::hash::BuildHasher
+/// Uses a user-provided [`hasher builder`](std::hash::BuildHasher) to hash the path components.
 pub struct FileTreeWriter<H: BuildHasher> {
+    /// User-provided hasher builder used to build the hasher which is used to hash the paths.
     hash_builder: H,
 
-    /// Temporary lookup map from each valid subpath added so far to its entry in the `path_parts` lookup array.
+    /// Temporary lookup map from each valid subpath added so far to its index
+    /// (or indices, if there's subpath string hash collisions) in the path_components lookup array.
+    ///
     /// Needed only by the writer, not serialized to the data blob.
     subpath_lookup: SubpathLookup,
 
-    /// Temporary lookup map from a single path part string's hash to its index
-    /// (indices if there's hash string hash collisions) in the `string_table`.
+    /// Temporary lookup map from a single path component string's hash to its index
+    /// (or indices, if there's subpath string hash collisions) in the `string_table`.
+    ///
     /// Needed only by the writer, not serialized to the data blob.
     string_lookup: StringLookup,
 
-    /// Temporary string buffer used by the writer to normalize the paths.
-    lowercase_buffer: String,
-
-    /// Persistent lookup map from a hash of each valid leaf file path to its entry in the `path_parts` lookup array.
+    /// Persistent lookup map from a full file path hash to its leaf path component.
+    /// `HashMap` and not a `MultiMap` because we don't allow hash collisions for leaf file paths.
+    ///
     /// Needed by the writer and serialized to the data blob.
-    path_lookup: HashMap<PathHash, PathPartIndex>,
+    path_lookup: HashMap<PathHash, LeafPathComponent>,
 
-    /// Persistent array of valid path parts / components added so far.
+    /// Persistent array of valid path components added so far (and some metadata useful when building the path string slightly more efficiently).
     /// Indexed into by entries of `subpath_lookup` and `path_lookup`.
-    /// Needed by the writer and serialized to the data blob.
-    path_parts: Vec<PathPart>,
+    ///
+    /// Needed by the writer and serialized to the data blob (path components only, not the metadata).
+    path_components: Vec<PathComponentAndMetadata>,
 
     /// Persistent array of unique string offsets and lengths in the `strings` buffer.
+    ///
     /// Needed by the writer and serialized to the data blob.
     string_table: Vec<InternedString>,
 
     /// Persistent string storage buffer.
     /// All unique strings are stored in it contiguously.
-    /// Indexed into by entries in the `offsets_and_lengths` array.
+    /// Indexed into by entries in the `string_table` array.
+    ///
     /// Needed by the writer and serialized to the data blob.
     strings: String,
 }
 
 impl<H: BuildHasher> FileTreeWriter<H> {
-    /// Create a new [`file tree writer`] with the provided `hash_builder`.
+    /// Create a new [`file tree writer`] with the provided [`hash_builder`].
     ///
-    /// `hash_builder` is used to hash [`inserted`] paths and their subpaths / individual components.
+    /// [`hash_builder`] is used to hash [`inserted`] paths and their subpaths / individual components.
     ///
     /// [`file tree writer`]: struct.FileTreeWriter.html
     /// [`inserted`]: #method.insert
+    /// [`hash_builder`]: std::hash::BuildHasher
     pub fn new(hash_builder: H) -> Self {
         Self {
             hash_builder,
             subpath_lookup: SubpathLookup::new(),
             string_lookup: StringLookup::new(),
-            lowercase_buffer: String::new(),
             path_lookup: HashMap::new(),
-            path_parts: Vec::new(),
+            path_components: Vec::new(),
             string_table: Vec::new(),
             strings: String::new(),
         }
     }
 
-    /// Inserts the `path` to a file into the writer and returns its [`hash`].
+    /// Inserts the [`path`](FilePath) to a file into the writer and returns its [`hash`].
     ///
-    /// Returned [`hash`] is calculated by hashing each path component converted to lowercase in order, root to leaf. Separators are not included.
+    /// Returned [`hash`] is calculated by hashing each path component, root to leaf (excluding the separators),
+    /// using the [`hash builder`](std::hash::BuildHasher) provided in the call to [`new`](#methods.new).
     ///
-    /// Valid paths are relative, do no contain prefixes, root/curent/parent directory redirectors,
-    /// and contain valid UTF-8.
-    /// Paths are converted to lower case before hashing / inserting.
-    /// Path hash collisions are treated as [`errors`].
-    ///
-    /// Examples of valid paths: "foo/bar/baz.txt", "BOB" (inserted as "bob"), "áéíóú\\αβγδε".
-    /// Examples of invalid paths: "C:/foo" (has a prefix and a root directory),
-    /// "/bar/baz.txt" (has a root directory), "a/../b" (has a parent directory),
-    /// "f/oo" and "fo/o" (these have the same hash).
+    /// Full path hash collisions are treated as [`errors`].
     ///
     /// [`hash`]: type.PathHash.html
     /// [`errors`]: enum.FileTreeWriterError.html#variant.PathHashCollision
-    pub fn insert<P: AsRef<Path>>(&mut self, path: P) -> Result<PathHash, FileTreeWriterError> {
+    pub fn insert<P: AsRef<FilePath>>(&mut self, path: P) -> Result<PathHash, FileTreeWriterError> {
         use FileTreeWriterError::*;
 
         let path = path.as_ref();
 
-        // Validate the path, count the number of parts/components, and hash it to determine if we have a path hash collision.
+        // Count the number of components, and hash the path fully to determine if we have a path hash collision.
         // Need to preprocess to avoid inserting strings / subpaths into the lookup if the path is ultimately found to be invalid.
-        let mut num_parts = 0;
-        let mut hasher = self.hash_builder.build_hasher();
+        let (num_components, path_hash) = {
+            let mut hasher = self.hash_builder.build_hasher();
+            let mut num_components: NumComponents = 0;
 
-        for (idx, path_part) in path.components().enumerate() {
-            match path_part {
-                Component::Normal(path_part) => {
-                    if path_part.is_empty() {
-                        return Err(EmptyPathComponent(
-                            path.components().take(idx).collect::<PathBuf>(),
-                        ));
-                    }
-
-                    if let Some(path_part) = path_part.to_str() {
-                        // Convert to lowercase, then hash.
-                        hasher.write(
-                            Self::to_lower_str(path_part, &mut self.lowercase_buffer).as_bytes(),
-                        );
-                    } else {
-                        return Err(InvalidUTF8(
-                            path.components().take(idx).collect::<PathBuf>(),
-                        ));
-                    }
-
-                    num_parts += 1;
-                }
-                Component::Prefix(_) => return Err(PrefixedPath),
-                Component::CurDir | Component::ParentDir | Component::RootDir => {
-                    return Err(InvalidPathComponent(
-                        path.components().take(idx).collect::<PathBuf>(),
-                    ))
-                }
+            for path_component in path.components() {
+                hasher.write(path_component.as_bytes());
+                num_components += 1;
             }
-        }
 
-        if num_parts == 0 {
-            return Err(EmptyPath);
-        }
+            debug_assert!(num_components > 0, "valid paths are not empty");
+
+            (num_components, hasher.finish())
+        };
 
         // Check for full file path hash collisions.
-        let path_hash = hasher.finish();
-
-        if let Some(&existing_index) = self.path_lookup.get(&path_hash) {
+        if let Some(&existing_path_component) = self.path_lookup.get(&path_hash) {
             return Err(FileTreeWriterError::PathHashCollision(
-                self.path_string(existing_index).into(),
+                self.path_buf(existing_path_component.path_component_index),
             ));
         }
 
-        hasher = self.hash_builder.build_hasher();
+        let mut hasher = self.hash_builder.build_hasher();
 
-        // Index of the parent path part/component for each processed path part/component;
-        // index of the leaf/file path part/component after the last one was processed.
+        // Index of the parent path component for each processed path component in the loop below;
+        // index of the leaf/file path component after the last one was processed.
         let mut parent_index = None;
+        let mut string_len: FullStringLength = 0;
 
-        for (idx, path_part) in path.components().enumerate() {
-            // If it's the last path part/node, it must be the name of a file
+        for (path_component_idx, path_component) in path.components().enumerate() {
+            // If it's the last path component, it must be the name of a file
             // (and thus no other file/folder is allowed to exist at that path).
-            let last = idx == (num_parts - 1);
+            let last = path_component_idx == (num_components - 1) as _;
 
-            match path_part {
-                Component::Normal(path_part) => {
-                    // Must succeed - validated above.
-                    if let Some(path_part) = path_part.to_str() {
-                        debug_assert!(!path_part.is_empty());
+            string_len += path_component.len() as FullStringLength;
 
-                        // Convert to lowercase.
-                        let path_part = Self::to_lower_str(path_part, &mut self.lowercase_buffer);
+            // Hash the subpath so far.
+            hasher.write(path_component.as_bytes());
+            let subpath_hash = hasher.finish();
 
-                        // Then hash.
-                        hasher.write(path_part.as_bytes());
-                        let subpath_hash = hasher.finish();
-
-                        // Check if the path part for this subpath already exists.
-                        let mut path_part_index: Option<PathPartIndex> = None;
-
-                        if let Some(existing_index) = Self::find_existing_subpath(
-                            &self.subpath_lookup,
-                            &self.path_parts,
-                            &self.string_table,
-                            &self.strings,
-                            path_part,
-                            subpath_hash,
-                            parent_index,
-                        ) {
-                            // Make sure that
-                            // 1) we're not processing the leaf/file part/component
-                            // (because we can't have a new file with the same name as an existing file/folder);
-                            // 2) the subpath is not a path to an existing file
-                            // (because we can't have a new file/folder with the same name as an existing file);
-                            if last {
-                                return Err(FileOrFolderAlreadyExistsAtFilePath(
-                                    self.path_string(existing_index).into(),
-                                ));
-                            }
-
-                            if self.path_lookup.contains_key(&subpath_hash) {
-                                return Err(FileAlreadyExistsAtFileOrFolderPath(
-                                    self.path_string(existing_index).into(),
-                                ));
-                            }
-
-                            path_part_index.replace(existing_index);
-                        }
-
-                        let string_lookup = &mut self.string_lookup;
-                        let string_table = &mut self.string_table;
-                        let strings = &mut self.strings;
-                        let path_parts = &mut self.path_parts;
-                        let hash_builder = &self.hash_builder;
-                        let subpath_lookup = &mut self.subpath_lookup;
-
-                        let path_part_index = path_part_index.unwrap_or_else(|| {
-                            // If this subpath doesn't exist yet, we're going to add it.
-                            let path_part_index = Self::add_path_part(
-                                string_lookup,
-                                string_table,
-                                strings,
-                                path_parts,
-                                hash_builder,
-                                path_part,
-                                parent_index,
-                            );
-
-                            subpath_lookup.insert(subpath_hash, path_part_index);
-
-                            path_part_index
-                        });
-
-                        // Update the parent index to the current path part index.
-                        parent_index.replace(path_part_index);
-
-                    // Unreachable - validated above.
-                    } else {
-                        debug_unreachable();
-                    }
+            // Check if the path component for this subpath already exists.
+            let path_component_index = if let Some(existing_index) = Self::find_existing_subpath(
+                &self.subpath_lookup,
+                &self.path_components,
+                &self.string_table,
+                &self.strings,
+                path_component,
+                subpath_hash,
+                parent_index,
+            ) {
+                // Make sure that
+                // 1) we're not processing the leaf/file component
+                // (because we can't have a new file with the same name as an existing file/folder);
+                // ...
+                if last {
+                    return Err(FileOrFolderAlreadyExistsAtFilePath(
+                        self.path_buf(existing_index).into(),
+                    ));
                 }
-                // Unreachable - validated above.
-                _ => debug_unreachable(),
+
+                // ...
+                // 2) the subpath is not a path to an existing file
+                // (because we can't have a new file/folder with the same name as an existing file);
+                if self.path_lookup.contains_key(&subpath_hash) {
+                    return Err(FileAlreadyExistsAtFileOrFolderPath(
+                        self.path_buf(existing_index).into(),
+                    ));
+                }
+
+                existing_index
+
+            // If this subpath doesn't exist yet, we're going to add it.
+            } else {
+                let path_component_index = Self::add_path_component(
+                    &mut self.string_lookup,
+                    &mut self.string_table,
+                    &mut self.strings,
+                    &mut self.path_components,
+                    &self.hash_builder,
+                    path_component,
+                    parent_index,
+                    path_component_idx as NumComponents + 1,
+                    string_len,
+                );
+
+                self.subpath_lookup
+                    .insert(subpath_hash, path_component_index);
+
+                path_component_index
+            };
+
+            // Update the parent index to the current path component index.
+            parent_index.replace(path_component_index);
+
+            if !last {
+                string_len += 1;
             }
         }
 
-        self.lowercase_buffer.clear();
-
-        // Update the path lookup with the path part index for the lead node.
         debug_assert_eq!(path_hash, hasher.finish());
 
-        // Must succeed if we got here, or we'd error out above.
-        debug_assert!(parent_index.is_some());
-        let parent_index = parent_index.unwrap_or(0);
+        // Update the path lookup with the path component index for the leaf node.
 
-        let _none = self.path_lookup.insert(path_hash, parent_index);
-        // Must be none, or we'd error out above.
+        // Must succeed if we got here, or we'd error out above.
+        let parent_index = unsafe { debug_unwrap(parent_index) };
+
+        let _none = self.path_lookup.insert(
+            path_hash,
+            LeafPathComponent::new(parent_index, num_components, string_len),
+        );
+        // Must be `None`, or we'd error out above.
         debug_assert!(_none.is_none());
 
         Ok(path_hash)
     }
 
-    /// Consumes the [`file tree writer`] and serializes its data to the writer `w`.
+    /// Consumes the [`writer`](FileTreeWriter) and serializes its data to the writer `w`.
+    /// Stores the user-provided "version" into the header.
     /// Produced data blob may then be used by the [`FileTreeReader`].
-    ///
-    /// [`file tree writer`]: struct.FileTreeWriter.html
-    /// [`FileTreeReader`]: struct.FileTreeReader.html
-    pub fn write<W: Write>(self, w: &mut W) -> Result<usize, io::Error> {
+    pub fn write<W: Write>(self, version: u64, w: &mut W) -> Result<usize, io::Error> {
         let mut written = 0;
 
         // Header.
-        written += FileTreeHeader::write(
-            w,
+        let header = FileTreeHeader::new(
             self.path_lookup.len() as _,
-            self.path_parts.len() as _,
+            self.path_components.len() as _,
             self.string_table.len() as _,
-        )?;
+            version,
+        );
+
+        written += header.write(w)?;
 
         debug_assert!(written % 8 == 0, "should be aligned to 8 bytes");
 
         // Path lookup.
 
         // Get and sort the path hashes.
-        // TODO: use a `BTreeMap`?
         let mut path_hashes = self.path_lookup.keys().cloned().collect::<Vec<_>>();
         path_hashes.sort();
 
@@ -291,30 +255,21 @@ impl<H: BuildHasher> FileTreeWriter<H> {
 
         debug_assert!(written % 8 == 0, "should be aligned to 8 bytes");
 
-        // Write the path part indices.
-        for path_part_index in path_hashes
+        // Write the leaf path components.
+        for leaf_path_component in path_hashes
             .iter()
-            .map(|path_hash| *self.path_lookup.get(path_hash).unwrap())
+            // Must succeed - all keys are contained in the map.
+            .map(|path_hash| *unsafe { debug_unwrap(self.path_lookup.get(path_hash)) })
         {
-            written += w.write(&u32_to_bin_bytes(path_part_index))?;
-        }
-
-        // Align to 8 bytes.
-        let alignment = written % 8;
-
-        for _ in 0..alignment {
-            written += w.write(&[0u8])?;
+            written += leaf_path_component.write(w)?;
         }
 
         debug_assert!(written % 8 == 0, "should be aligned to 8 bytes");
 
-        // Path parts array.
+        // Path components array.
 
-        for &path_part in self.path_parts.iter() {
-            written += w.write(&u32_to_bin_bytes(path_part.string_index))?;
-            written += w.write(&u32_to_bin_bytes(
-                path_part.parent_index.map(NonZeroU32::get).unwrap_or(0),
-            ))?;
+        for path_component in self.path_components {
+            written += path_component.path_component.write(w)?;
         }
 
         debug_assert!(written % 8 == 0, "should be aligned to 8 bytes");
@@ -323,11 +278,10 @@ impl<H: BuildHasher> FileTreeWriter<H> {
 
         // Patch up the string offsets to be relative to the start of the blob.
         let string_offset =
-            (written + self.string_table.len() * size_of::<InternedString>()) as u32;
+            (written + self.string_table.len() * size_of::<PackedInternedString>()) as StringOffset;
 
         for &offset_and_length in self.string_table.iter() {
-            written += w.write(&u32_to_bin_bytes(string_offset + offset_and_length.offset))?;
-            written += w.write(&u32_to_bin_bytes(offset_and_length.len))?;
+            written += offset_and_length.write(w, string_offset)?;
         }
 
         debug_assert!(written % 8 == 0, "should be aligned to 8 bytes");
@@ -339,43 +293,94 @@ impl<H: BuildHasher> FileTreeWriter<H> {
         Ok(written as _)
     }
 
-    /// Returns the index of the existing path part with `subpath_hash` and the current component `path_part`, if one exists.
+    /// Consumes the [`writer`](FileTreeWriter) and serializes its data to the byte vec.
+    /// Stores the user-provided "version" into the header.
+    /// Produced data blob may then be used by the [`FileTreeReader`].
+    pub fn write_to_vec(self, version: u64) -> Result<Vec<u8>, io::Error> {
+        let mut result = Vec::new();
+        self.write(version, &mut result)?;
+        Ok(result)
+    }
+
+    /// Returns the number of [`file paths`](FilePath) [`inserted`](#method.insert) into the writer.
+    pub fn len(&self) -> usize {
+        self.path_lookup.len()
+    }
+
+    /// Returns the number of unique strings [`inserted`](#method.insert) into the writer.
+    pub fn num_strings(&self) -> usize {
+        self.string_table.len()
+    }
+
+    /// Returns the total length in bytes of all unique strings [`inserted`](#method.insert) into the writer.
+    pub fn string_len(&self) -> usize {
+        self.strings.len()
+    }
+
+    /// Clears the writer, resetting all internal data structures without deallocating any storage.
+    pub fn clear(&mut self) {
+        self.subpath_lookup.clear();
+        self.string_lookup.clear();
+        self.path_lookup.clear();
+        self.path_components.clear();
+        self.string_table.clear();
+        self.strings.clear();
+    }
+
+    /// Returns the index of the existing path component with `subpath_hash` and the current component `path_component`, if one exists.
     /// The caller guarantees `parent_index` is valid, if `Some`.
     fn find_existing_subpath(
         subpath_lookup: &SubpathLookup,
-        path_parts: &Vec<PathPart>,
-        string_table: &Vec<InternedString>,
+        path_components: &[PathComponentAndMetadata],
+        string_table: &[InternedString],
         strings: &String,
-        path_part: &str,
+        path_component: FilePathComponent,
         subpath_hash: PathHash,
-        parent_index: Option<PathPartIndex>,
-    ) -> Option<PathPartIndex> {
+        parent_index: Option<PathComponentIndex>,
+    ) -> Option<PathComponentIndex> {
         let mut result = None;
 
         if let Some(existing_indices) = subpath_lookup.get(&subpath_hash) {
             'indices: for &existing_index in existing_indices {
-                let mut existing_subpath =
-                    Self::iter_impl(path_parts, string_table, strings, existing_index);
+                debug_assert!((existing_index as usize) < path_components.len());
+                let existing_path_component =
+                    unsafe { *path_components.get_unchecked(existing_index as usize) };
 
-                // Must be `Some` - empty paths are not allowed.
-                if let Some(existing_path_part) = existing_subpath.next() {
-                    if path_part != existing_path_part {
-                        // New and existing path part strings mismatch.
-                        debug_assert!(result.is_none());
-                        continue 'indices;
-                    }
-                } else {
-                    debug_unreachable();
+                let mut existing_subpath = Self::iter_impl(
+                    path_components,
+                    string_table,
+                    strings,
+                    existing_path_component.path_component,
+                    existing_path_component.num_components,
+                );
+
+                // Must succeed - empty paths are not allowed.
+                let existing_path_component = unsafe { debug_unwrap(existing_subpath.next()) };
+
+                if path_component != existing_path_component {
+                    // New and existing path component strings mismatch.
+                    debug_assert!(result.is_none());
+                    continue 'indices;
                 }
 
                 if let Some(mut new_subpath) = parent_index.map(|parent_index| {
-                    Self::iter_impl(path_parts, string_table, strings, parent_index)
+                    debug_assert!((parent_index as usize) < path_components.len());
+                    let parent_path_component =
+                        unsafe { *path_components.get_unchecked(parent_index as usize) };
+
+                    Self::iter_impl(
+                        path_components,
+                        string_table,
+                        strings,
+                        parent_path_component.path_component,
+                        parent_path_component.num_components,
+                    )
                 }) {
                     loop {
-                        if let Some(existing_path_part) = existing_subpath.next() {
-                            if let Some(new_path_part) = new_subpath.next() {
-                                if new_path_part != existing_path_part {
-                                    // New and existing path part strings mismatch.
+                        if let Some(existing_path_component) = existing_subpath.next() {
+                            if let Some(new_path_component) = new_subpath.next() {
+                                if new_path_component != existing_path_component {
+                                    // New and existing path component strings mismatch.
                                     debug_assert!(result.is_none());
                                     continue 'indices;
                                 }
@@ -397,7 +402,7 @@ impl<H: BuildHasher> FileTreeWriter<H> {
                     result.replace(existing_index);
                     break 'indices;
                 } else if existing_subpath.next().is_none() {
-                    // New and existing paths are the same length - 1.
+                    // New and existing paths are the same length (one component).
                     result.replace(existing_index);
                     break 'indices;
                 } else {
@@ -410,32 +415,22 @@ impl<H: BuildHasher> FileTreeWriter<H> {
         result
     }
 
-    fn to_lower_str<'s>(string: &str, buf: &'s mut String) -> &'s str {
-        buf.clear();
-        to_lower_str(string, buf);
-        buf.as_str()
-    }
-
-    fn hash_string(mut hasher: H::Hasher, string: &str) -> PathHash {
+    fn hash_string(mut hasher: H::Hasher, string: FilePathComponent) -> PathHash {
         hasher.write(string.as_bytes());
         hasher.finish()
     }
 
     /// Adds the unique `string` with `hash` to the lookup data structures and returns its index.
-    /// The caller guarantees `string` with `hash` has not been interned yet.
+    ///
+    /// The caller guarantees that `string` with `hash` has not been interned yet.
     fn intern_string(
         string_lookup: &mut StringLookup,
         string_table: &mut Vec<InternedString>,
         strings: &mut String,
-        string: &str,
+        string: FilePathComponent,
         hash: PathHash,
     ) -> StringIndex {
-        debug_assert!(!string.is_empty());
-
-        let offset_and_len = InternedString {
-            offset: strings.len() as _,
-            len: string.len() as _,
-        };
+        let offset_and_len = InternedString::new(strings.len() as _, string.len() as _);
         strings.push_str(string);
         let string_index = string_table.len() as _;
         string_table.push(offset_and_len);
@@ -443,17 +438,18 @@ impl<H: BuildHasher> FileTreeWriter<H> {
         string_index
     }
 
-    /// Returns the string index of the interned `string`, if it is interned, or interns it and returns its index.
+    /// Returns the string index of the interned `string` in the string table, if it is interned,
+    /// or interns it and returns its new index in the string table.
+    ///
+    /// The caller guarantees the `string` is not empty.
     fn interned_string_index(
         string_lookup: &mut StringLookup,
         string_table: &mut Vec<InternedString>,
         strings: &mut String,
         hasher: H::Hasher,
-        string: &str,
+        string: FilePathComponent,
     ) -> StringIndex {
-        debug_assert!(!string.is_empty());
-
-        // First hash the path part's string and check if was already added.
+        // First hash the path component's string and check if was already added.
         let string_hash = Self::hash_string(hasher, string);
 
         if let Some(string_index) = string_lookup
@@ -461,8 +457,8 @@ impl<H: BuildHasher> FileTreeWriter<H> {
             .get(&string_hash)
             // Then compare the strings.
             .map(|string_indices| {
-                string_indices.iter().cloned().find(|&string_index| {
-                    string_impl(string_table, strings, string_index) == string
+                string_indices.iter().cloned().find(|string_index| {
+                    string_impl(string_table, strings, *string_index) == string
                 })
             })
             .flatten()
@@ -475,146 +471,193 @@ impl<H: BuildHasher> FileTreeWriter<H> {
         }
     }
 
-    fn add_path_part(
+    /// The caller guarantees the `path_component` with `parent_index` does not exist in the `path_components` array.
+    fn add_path_component(
         string_lookup: &mut StringLookup,
         string_table: &mut Vec<InternedString>,
         strings: &mut String,
-        path_parts: &mut Vec<PathPart>,
+        path_components: &mut Vec<PathComponentAndMetadata>,
         hash_builder: &H,
-        path_part: &str,
-        parent_index: Option<PathPartIndex>,
-    ) -> PathPartIndex {
+        path_component: FilePathComponent,
+        parent_index: Option<PathComponentIndex>,
+        num_components: NumComponents,
+        string_len: FullStringLength,
+    ) -> PathComponentIndex {
+        // Get / intern the path component's string index in the string table.
         let string_index = Self::interned_string_index(
             string_lookup,
             string_table,
             strings,
             hash_builder.build_hasher(),
-            path_part,
+            path_component,
         );
 
-        // Add a new path part to the lookup array, using the current parent index, if any (don't forget to `+1`).
-        let path_part_index = path_parts.len() as PathPartIndex;
+        // Add a new path component to the lookup array, using the current parent index, if any.
+        let path_component = PathComponent::new(string_index, parent_index);
 
-        let path_part = PathPart {
-            parent_index: parent_index
-                .map(|parent_index| unsafe { NonZeroU32::new_unchecked(parent_index + 1) }),
-            string_index,
-        };
-        debug_assert!(!path_parts.contains(&path_part));
-        path_parts.push(path_part);
+        #[cfg(debug_assertions)]
+        {
+            for path_component_ in path_components.iter() {
+                debug_assert!(path_component_.path_component != path_component);
+            }
+        }
 
-        path_part_index
+        let path_component_index = path_components.len() as _;
+        debug_assert!(num_components > 0);
+        path_components.push(PathComponentAndMetadata {
+            path_component,
+            num_components,
+            string_len,
+        });
+
+        path_component_index
     }
 
-    /// Returns a reverse (leaf to root) iterator over path parts / components of the path starting with the part at `index`.
-    /// The caller guarantees the path part `index` is valid.
-    fn iter(&self, index: PathPartIndex) -> impl Iterator<Item = &'_ str> {
-        Self::iter_impl(&self.path_parts, &self.string_table, &self.strings, index)
-    }
-
-    /// Returns a reverse (leaf to root) iterator over path parts / components of the path starting with the part at `index`.
-    /// The caller guarantees the path part `index` is valid.
-    fn iter_impl<'a>(
-        path_parts: &'a Vec<PathPart>,
-        string_table: &'a Vec<InternedString>,
-        strings: &'a String,
-        index: PathPartIndex,
-    ) -> impl Iterator<Item = &'a str> {
-        debug_assert!((index as usize) < path_parts.len());
-
-        PathIter::new(
-            path_parts,
-            string_table,
-            strings,
-            Some(unsafe { *path_parts.get_unchecked(index as usize) }),
+    /// Returns a reverse (leaf to root) iterator over path components of the path starting with `path_component`.
+    /// The caller guarantees the path ending with `path_component` actually has `num_components`.
+    fn iter(
+        &self,
+        path_component: PathComponent,
+        num_components: NumComponents,
+    ) -> impl ExactSizeIterator<Item = FilePathComponent> {
+        Self::iter_impl(
+            &self.path_components,
+            &self.string_table,
+            &self.strings,
+            path_component,
+            num_components,
         )
     }
 
-    /// The caller guarantees the path part `index` is valid.
-    fn build_path_string(&self, index: PathPartIndex, string: &mut String) {
-        build_path_string(|| self.iter(index), string);
+    /// Returns a reverse (leaf to root) iterator over path components of the path starting with `path_component`.
+    /// The caller guarantees the path ending with `path_component` actually has `num_components`.
+    fn iter_impl<'a>(
+        path_components: &'a [PathComponentAndMetadata],
+        string_table: &'a [InternedString],
+        strings: &'a String,
+        path_component: PathComponent,
+        num_components: NumComponents,
+    ) -> impl ExactSizeIterator<Item = &'a NonEmptyStr> {
+        PathIter::new(
+            path_components,
+            string_table,
+            strings,
+            path_component,
+            num_components,
+        )
     }
 
-    /// The caller guarantees the path part `index` is valid.
-    fn path_string(&self, index: PathPartIndex) -> String {
-        let mut string = String::new();
-        self.build_path_string(index, &mut string);
-        string
+    /// Used for error reporting.
+    /// The caller guarantees the path component `index` is valid.
+    fn path_buf(&self, index: PathComponentIndex) -> FilePathBuf {
+        debug_assert!((index as usize) < self.path_components.len());
+        let path_component = unsafe { *self.path_components.get_unchecked(index as usize) };
+
+        let mut string = String::with_capacity(path_component.string_len as _);
+
+        build_path_string(
+            || self.iter(path_component.path_component, path_component.num_components),
+            path_component.string_len,
+            &mut string,
+        );
+
+        unsafe { FilePathBuf::new_unchecked(string) }
     }
 
     #[cfg(test)]
-    fn lookup(&self, hash: PathHash) -> Option<String> {
+    fn lookup(&self, hash: PathHash) -> Option<FilePathBuf> {
         self.path_lookup
             .get(&hash)
-            .map(|&path_part_index| self.path_string(path_part_index))
+            .map(|leaf_path_component| self.path_buf(leaf_path_component.path_component_index))
     }
-}
-
-/// The caller guarantees the path part `index` is valid.
-fn path_part_impl(path_parts: &Vec<PathPart>, index: PathPartIndex) -> PathPart {
-    debug_assert!((index as usize) < path_parts.len());
-    unsafe { *path_parts.get_unchecked(index as usize) }
 }
 
 /// The caller guarantees the string `index` is valid.
 fn string_impl<'s>(
-    string_table: &Vec<InternedString>,
+    string_table: &[InternedString],
     strings: &'s String,
     index: StringIndex,
-) -> &'s str {
+) -> &'s NonEmptyStr {
     debug_assert!((index as usize) < string_table.len());
     let string = unsafe { string_table.get_unchecked(index as usize) };
-    debug_assert!((string.offset as usize) < strings.len());
-    debug_assert!(((string.offset + string.len) as usize) <= strings.len());
-    unsafe { strings.get_unchecked(string.offset as usize..(string.offset + string.len) as usize) }
+    debug_assert!(string.offset < strings.len() as _);
+    debug_assert!((string.offset + string.len as StringOffset) <= strings.len() as StringOffset);
+    unsafe {
+        NonEmptyStr::new_unchecked(strings.get_unchecked(
+            string.offset as usize..(string.offset + string.len as StringOffset) as usize,
+        ))
+    }
 }
 
 struct PathIter<'a> {
-    path_parts: &'a Vec<PathPart>,
-    string_table: &'a Vec<InternedString>,
+    path_components: &'a [PathComponentAndMetadata],
+    string_table: &'a [InternedString],
     strings: &'a String,
-    cur_part: Option<PathPart>,
+    current_component: Option<PathComponent>,
+    num_components: NumComponents,
 }
 
 impl<'a> PathIter<'a> {
     fn new(
-        path_parts: &'a Vec<PathPart>,
-        string_table: &'a Vec<InternedString>,
+        path_components: &'a [PathComponentAndMetadata],
+        string_table: &'a [InternedString],
         strings: &'a String,
-        cur_part: Option<PathPart>,
+        path_component: PathComponent,
+        num_components: NumComponents,
     ) -> Self {
         Self {
-            path_parts,
+            path_components,
             string_table,
             strings,
-            cur_part,
+            current_component: Some(path_component),
+            num_components,
         }
     }
 }
 
 impl<'a> Iterator for PathIter<'a> {
-    type Item = &'a str;
+    type Item = &'a NonEmptyStr;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(path_part) = self.cur_part.take() {
-            let str = string_impl(self.string_table, self.strings, path_part.string_index);
+        if let Some(path_component) = self.current_component.take() {
+            let str = string_impl(self.string_table, self.strings, path_component.string_index);
 
-            if let Some(parent_index) = path_part.parent_index {
-                self.cur_part
-                    .replace(path_part_impl(self.path_parts, parent_index.get() - 1));
+            if let Some(parent_index) = path_component.parent_index {
+                self.current_component
+                    .replace(path_component_impl(self.path_components, parent_index));
             }
+
+            debug_assert!(self.num_components > 0);
+            self.num_components -= 1;
 
             Some(str)
         } else {
+            debug_assert!(self.num_components == 0);
+
             None
         }
     }
 }
 
+impl<'a> ExactSizeIterator for PathIter<'a> {
+    fn len(&self) -> usize {
+        self.num_components as _
+    }
+}
+
+/// The caller guarantees the path component `index` is valid.
+fn path_component_impl(
+    path_components: &[PathComponentAndMetadata],
+    index: PathComponentIndex,
+) -> PathComponent {
+    debug_assert!((index as usize) < path_components.len());
+    unsafe { path_components.get_unchecked(index as usize) }.path_component
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
-    use {super::*, seahash::SeaHasher};
+    use {super::*, minifilepath_macro::filepath, seahash::SeaHasher};
 
     #[derive(Default)]
     struct BuildSeaHasher;
@@ -628,82 +671,35 @@ mod tests {
     }
 
     #[test]
-    fn EmptyPath() {
-        let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
-
-        assert!(matches!(
-            writer.insert("").err().unwrap(),
-            FileTreeWriterError::EmptyPath
-        ));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn InvalidUTF8() {
-        use std::os::windows::ffi::OsStringExt;
-
-        let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
-
-        let bytes: &[u16] = &[0xD800];
-
-        let os_string = std::ffi::OsString::from_wide(bytes);
-
-        assert!(
-            matches!(writer.insert(&os_string).err().unwrap(), FileTreeWriterError::InvalidUTF8(x) if x == PathBuf::new())
-        );
-    }
-
-    #[test]
-    fn PrefixedPath() {
-        let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
-
-        assert!(matches!(
-            writer.insert("C:/foo").err().unwrap(),
-            FileTreeWriterError::PrefixedPath
-        ));
-    }
-
-    #[test]
-    fn InvalidPathComponent() {
-        let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
-
-        assert!(
-            matches!(writer.insert("/foo").err().unwrap(), FileTreeWriterError::InvalidPathComponent(x) if x == PathBuf::new())
-        );
-        assert!(
-            matches!(writer.insert("./foo").err().unwrap(), FileTreeWriterError::InvalidPathComponent(x) if x == PathBuf::new())
-        );
-        assert!(
-            matches!(writer.insert("foo/../bar").err().unwrap(), FileTreeWriterError::InvalidPathComponent(x) if x == PathBuf::from("foo"))
-        );
-    }
-
-    #[test]
     fn FileOrFolderAlreadyExistsAtFilePath() {
         {
             let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
 
-            let foo_bar = writer.insert("foo/bar").unwrap();
+            assert_eq!(writer.len(), 0);
 
-            assert_eq!(writer.lookup(foo_bar).unwrap(), "foo/bar".to_string());
+            let foo_bar = writer.insert(filepath!("foo/bar")).unwrap();
+
+            assert_eq!(writer.len(), 1);
+
+            assert_eq!(
+                writer.lookup(foo_bar).unwrap().as_str(),
+                "foo/bar".to_string()
+            );
 
             assert!(
-                matches!(writer.insert("foo").err().unwrap(), FileTreeWriterError::FileOrFolderAlreadyExistsAtFilePath(x) if x == PathBuf::from("foo"))
+                matches!(writer.insert(filepath!("foo")).err().unwrap(), FileTreeWriterError::FileOrFolderAlreadyExistsAtFilePath(x) if x == FilePathBuf::new("foo").unwrap())
             );
         }
 
         {
             let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
 
-            let foo_bar_baz = writer.insert("foo/bar/baz").unwrap();
+            let foo_bar_baz = writer.insert(filepath!("foo/bar/baz")).unwrap();
 
-            assert_eq!(
-                writer.lookup(foo_bar_baz).unwrap(),
-                "foo/bar/baz".to_string()
-            );
+            assert_eq!(writer.lookup(foo_bar_baz).unwrap().as_str(), "foo/bar/baz");
 
             assert!(
-                matches!(writer.insert("foo/bar").err().unwrap(), FileTreeWriterError::FileOrFolderAlreadyExistsAtFilePath(x) if x == PathBuf::from("foo/bar"))
+                matches!(writer.insert(filepath!("foo/bar")).err().unwrap(), FileTreeWriterError::FileOrFolderAlreadyExistsAtFilePath(x) if x == FilePathBuf::new("foo/bar").unwrap())
             );
         }
     }
@@ -713,24 +709,24 @@ mod tests {
         {
             let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
 
-            let foo = writer.insert("foo").unwrap();
+            let foo = writer.insert(filepath!("foo")).unwrap();
 
-            assert_eq!(writer.lookup(foo).unwrap(), "foo".to_string());
+            assert_eq!(writer.lookup(foo).unwrap().as_str(), "foo");
 
             assert!(
-                matches!(writer.insert("foo/bar").err().unwrap(), FileTreeWriterError::FileAlreadyExistsAtFileOrFolderPath(x) if x == PathBuf::from("foo"))
+                matches!(writer.insert(filepath!("foo/bar")).err().unwrap(), FileTreeWriterError::FileAlreadyExistsAtFileOrFolderPath(x) if x == FilePathBuf::new("foo").unwrap())
             );
         }
 
         {
             let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
 
-            let foo_bar = writer.insert("foo/bar").unwrap();
+            let foo_bar = writer.insert(filepath!("foo/bar")).unwrap();
 
-            assert_eq!(writer.lookup(foo_bar).unwrap(), "foo/bar".to_string());
+            assert_eq!(writer.lookup(foo_bar).unwrap().as_str(), "foo/bar");
 
             assert!(
-                matches!(writer.insert("foo/bar/baz").err().unwrap(), FileTreeWriterError::FileAlreadyExistsAtFileOrFolderPath(x) if x == PathBuf::from("foo/bar"))
+                matches!(writer.insert(filepath!("foo/bar/baz")).err().unwrap(), FileTreeWriterError::FileAlreadyExistsAtFileOrFolderPath(x) if x == FilePathBuf::new("foo/bar").unwrap())
             );
         }
     }
@@ -797,39 +793,36 @@ mod tests {
         {
             let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
 
-            let fo_o = writer.insert("fo/o").unwrap();
+            let fo_o = writer.insert(filepath!("fo/o")).unwrap();
 
-            assert_eq!(writer.lookup(fo_o).unwrap(), "fo/o".to_string());
+            assert_eq!(writer.lookup(fo_o).unwrap().as_str(), "fo/o");
 
             assert!(
-                matches!(writer.insert("f/oo").err().unwrap(), FileTreeWriterError::PathHashCollision(x) if x == PathBuf::from("fo/o"))
+                matches!(writer.insert(filepath!("f/oo")).err().unwrap(), FileTreeWriterError::PathHashCollision(x) if x == FilePathBuf::new("fo/o").unwrap())
             );
         }
 
         {
             let mut writer = FileTreeWriter::new(BuildFNV1aHasher);
 
-            let cost_arring = writer.insert("cost/arring").unwrap();
+            let cost_arring = writer.insert(filepath!("cost/arring")).unwrap();
 
-            assert_eq!(
-                writer.lookup(cost_arring).unwrap(),
-                "cost/arring".to_string()
-            );
+            assert_eq!(writer.lookup(cost_arring).unwrap().as_str(), "cost/arring");
 
             assert!(
-                matches!(writer.insert("liq/uid").err().unwrap(), FileTreeWriterError::PathHashCollision(x) if x == PathBuf::from("cost/arring"))
+                matches!(writer.insert(filepath!("liq/uid")).err().unwrap(), FileTreeWriterError::PathHashCollision(x) if x == FilePathBuf::new("cost/arring").unwrap())
             );
         }
 
         {
             let mut writer = FileTreeWriter::new(BuildFNV1aHasher);
 
-            let altarag_es = writer.insert("altarag/es").unwrap();
+            let altarag_es = writer.insert(filepath!("altarag/es")).unwrap();
 
-            assert_eq!(writer.lookup(altarag_es).unwrap(), "altarag/es".to_string());
+            assert_eq!(writer.lookup(altarag_es).unwrap().as_str(), "altarag/es");
 
             assert!(
-                matches!(writer.insert("zink/es").err().unwrap(), FileTreeWriterError::PathHashCollision(x) if x == PathBuf::from("altarag/es"))
+                matches!(writer.insert(filepath!("zink/es")).err().unwrap(), FileTreeWriterError::PathHashCollision(x) if x == FilePathBuf::new("altarag/es").unwrap())
             );
         }
 
@@ -878,49 +871,37 @@ mod tests {
             {
                 let mut writer = FileTreeWriter::new(BuildMockHasher);
 
-                let foo_bar_baz = writer.insert("foo/bar/baz").unwrap();
+                let foo_bar_baz = writer.insert(filepath!("foo/bar/baz")).unwrap();
                 assert_eq!(foo_bar_baz, 3);
-                assert_eq!(
-                    writer.lookup(foo_bar_baz).unwrap(),
-                    "foo/bar/baz".to_string()
-                );
+                assert_eq!(writer.lookup(foo_bar_baz).unwrap().as_str(), "foo/bar/baz");
 
-                let bar = writer.insert("bar").unwrap();
+                let bar = writer.insert(filepath!("bar")).unwrap();
                 assert_eq!(bar, 2);
-                assert_eq!(writer.lookup(bar).unwrap(), "bar".to_string());
+                assert_eq!(writer.lookup(bar).unwrap().as_str(), "bar");
             }
 
             {
                 let mut writer = FileTreeWriter::new(BuildMockHasher);
 
-                let foo_bar_baz = writer.insert("foo/bar/baz").unwrap();
+                let foo_bar_baz = writer.insert(filepath!("foo/bar/baz")).unwrap();
                 assert_eq!(foo_bar_baz, 3);
-                assert_eq!(
-                    writer.lookup(foo_bar_baz).unwrap(),
-                    "foo/bar/baz".to_string()
-                );
+                assert_eq!(writer.lookup(foo_bar_baz).unwrap().as_str(), "foo/bar/baz");
 
-                let bob_foo_bar = writer.insert("bob/foo/bar").unwrap();
+                let bob_foo_bar = writer.insert(filepath!("bob/foo/bar")).unwrap();
                 assert_eq!(bob_foo_bar, 2);
-                assert_eq!(
-                    writer.lookup(bob_foo_bar).unwrap(),
-                    "bob/foo/bar".to_string()
-                );
+                assert_eq!(writer.lookup(bob_foo_bar).unwrap().as_str(), "bob/foo/bar");
             }
 
             {
                 let mut writer = FileTreeWriter::new(BuildMockHasher);
 
-                let foo_bar_baz = writer.insert("foo/bar/baz").unwrap();
+                let foo_bar_baz = writer.insert(filepath!("foo/bar/baz")).unwrap();
                 assert_eq!(foo_bar_baz, 3);
-                assert_eq!(
-                    writer.lookup(foo_bar_baz).unwrap(),
-                    "foo/bar/baz".to_string()
-                );
+                assert_eq!(writer.lookup(foo_bar_baz).unwrap().as_str(), "foo/bar/baz");
 
-                let foo_bill = writer.insert("foo/bill").unwrap();
+                let foo_bill = writer.insert(filepath!("foo/bill")).unwrap();
                 assert_eq!(foo_bill, 2);
-                assert_eq!(writer.lookup(foo_bill).unwrap(), "foo/bill".to_string());
+                assert_eq!(writer.lookup(foo_bill).unwrap().as_str(), "foo/bill");
             }
         }
     }
