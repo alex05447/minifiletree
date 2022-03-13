@@ -95,19 +95,19 @@ impl FileTreeHeader {
         let mut written = 0;
 
         // Magic.
-        written += w.write(&u32_to_bin_bytes(FILE_TREE_HEADER_MAGIC))?;
+        written += write_u32(w, FILE_TREE_HEADER_MAGIC)?;
 
         // Path lookup length.
-        written += w.write(&u32_to_bin_bytes(self.lookup_len))?;
+        written += write_u32(w, self.lookup_len)?;
 
         // Path components length.
-        written += w.write(&u32_to_bin_bytes(self.path_components_len))?;
+        written += write_u32(w, self.path_components_len)?;
 
         // String table length.
-        written += w.write(&u32_to_bin_bytes(self.string_table_len))?;
+        written += write_u32(w, self.string_table_len)?;
 
         // Version.
-        written += w.write(&u64_to_bin_bytes(self.version))?;
+        written += write_u64(w, self.version)?;
 
         debug_assert_eq!(written, std::mem::size_of::<Self>());
 
@@ -181,13 +181,13 @@ impl LeafPathComponent {
         let mut written = 0;
 
         // Path component index.
-        written += w.write(&u32_to_bin_bytes(self.path_component_index))?;
+        written += write_u32(w, self.path_component_index)?;
 
         // Num components.
-        written += w.write(&u16_to_bin_bytes(self.num_components))?;
+        written += write_u16(w, self.num_components)?;
 
         // Total string length.
-        written += w.write(&u16_to_bin_bytes(self.string_len))?;
+        written += write_u16(w, self.string_len)?;
 
         debug_assert_eq!(written, std::mem::size_of::<PackedLeafPathComponent>());
 
@@ -250,14 +250,15 @@ impl PathComponent {
         let mut written = 0;
 
         // String index.
-        written += w.write(&u32_to_bin_bytes(self.string_index))?;
+        written += write_u32(w, self.string_index)?;
 
         // Parent index.
-        written += w.write(&u32_to_bin_bytes(
+        written += write_u32(
+            w,
             self.parent_index
                 .map(|parent_index| parent_index + 1)
                 .unwrap_or(0),
-        ))?;
+        )?;
 
         debug_assert_eq!(written, std::mem::size_of::<PackedPathComponent>());
 
@@ -320,7 +321,7 @@ impl InternedString {
         let new_offset_and_len = Self::pack_offset_and_len(self.offset + offset, self.len);
 
         // Offset and length.
-        written += w.write(&u64_to_bin_bytes(new_offset_and_len))?;
+        written += write_u64(w, new_offset_and_len)?;
 
         debug_assert_eq!(written, std::mem::size_of::<PackedInternedString>());
 

@@ -250,7 +250,7 @@ impl<H: BuildHasher> FileTreeWriter<H> {
 
         // Write the path hashes.
         for &path_hash in path_hashes.iter() {
-            written += w.write(&u64_to_bin_bytes(path_hash))?;
+            written += write_u64(w, path_hash)?;
         }
 
         debug_assert!(written % 8 == 0, "should be aligned to 8 bytes");
@@ -288,7 +288,8 @@ impl<H: BuildHasher> FileTreeWriter<H> {
 
         // Strings.
 
-        written += w.write(self.strings.as_bytes())?;
+        w.write_all(self.strings.as_bytes())?;
+        written += self.strings.len();
 
         Ok(written as _)
     }
@@ -299,6 +300,7 @@ impl<H: BuildHasher> FileTreeWriter<H> {
     pub fn write_to_vec(self, version: u64) -> Result<Vec<u8>, io::Error> {
         let mut result = Vec::new();
         self.write(version, &mut result)?;
+        result.shrink_to_fit();
         Ok(result)
     }
 

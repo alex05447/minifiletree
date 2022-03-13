@@ -4,6 +4,7 @@ use {
     std::{
         collections::{hash_map::Entry, HashMap},
         hash::Hash,
+        io::Write,
         mem, slice,
     },
 };
@@ -173,4 +174,20 @@ pub(crate) unsafe fn debug_unwrap<T>(val: Option<T>) -> T {
     } else {
         debug_unreachable()
     }
+}
+
+fn write_all<W: Write>(w: &mut W, buf: &[u8]) -> Result<usize, std::io::Error> {
+    w.write_all(buf).map(|_| buf.len())
+}
+
+pub(crate) fn write_u64<W: Write>(w: &mut W, val: u64) -> Result<usize, std::io::Error> {
+    write_all(w, &u64_to_bin_bytes(val))
+}
+
+pub(crate) fn write_u32<W: Write>(w: &mut W, val: u32) -> Result<usize, std::io::Error> {
+    write_all(w, &u32_to_bin_bytes(val))
+}
+
+pub(crate) fn write_u16<W: Write>(w: &mut W, val: u16) -> Result<usize, std::io::Error> {
+    write_all(w, &u16_to_bin_bytes(val))
 }
