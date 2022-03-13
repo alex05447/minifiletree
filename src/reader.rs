@@ -747,9 +747,7 @@ mod tests {
         let num_strings = writer.num_strings();
         let string_len = writer.string_len();
 
-        let mut data = writer.write_to_vec(version).unwrap();
-        data.shrink_to_fit();
-        let data = data.into_boxed_slice();
+        let data = writer.write_to_vec(version).unwrap().into_boxed_slice();
 
         let test_reader = |build_lookup: bool| {
             let reader = {
