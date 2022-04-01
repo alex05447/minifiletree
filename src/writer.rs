@@ -1,6 +1,6 @@
 use {
     crate::*,
-    minifilepath::{FilePath, FilePathBuf, FilePathComponent},
+    minifilepath::{FilePath, FilePathBuf, FilePathBuilder, FilePathComponent},
     ministr::NonEmptyStr,
     std::{
         collections::HashMap,
@@ -329,6 +329,26 @@ impl<H: BuildHasher> FileTreeWriter<H> {
         self.strings.clear();
     }
 
+    /// Attempts to fill the `builder` with the [`file path`](FilePathBuf) associated with the file path `hash`, if any.
+    ///
+    /// Returns the `builder` back if the path `hash` does not have a [`file path`](FilePathBuf) associated with it.
+    pub fn lookup_into(
+        &self,
+        hash: PathHash,
+        builder: FilePathBuilder,
+    ) -> Result<FilePathBuf, FilePathBuilder> {
+        if let Some(lpc) = self.path_lookup.get(&hash) {
+            Ok(self.build_path_string(lpc.path_component_index, builder))
+        } else {
+            Err(builder)
+        }
+    }
+
+    /// Returns the [`file path`](FilePathBuf) associated with the file path `hash`, if any.
+    pub fn lookup(&self, hash: PathHash) -> Option<FilePathBuf> {
+        self.lookup_into(hash, FilePathBuilder::new()).ok()
+    }
+
     /// Returns the index of the existing path component with `subpath_hash` and the current component `path_component`, if one exists.
     /// The caller guarantees `parent_index` is valid, if `Some`.
     fn find_existing_subpath(
@@ -552,25 +572,26 @@ impl<H: BuildHasher> FileTreeWriter<H> {
     /// Used for error reporting.
     /// The caller guarantees the path component `index` is valid.
     fn path_buf(&self, index: PathComponentIndex) -> FilePathBuf {
+        self.build_path_string(index, FilePathBuilder::new())
+    }
+
+    /// The caller guarantees the path component `index` is valid.
+    fn build_path_string(
+        &self,
+        index: PathComponentIndex,
+        builder: FilePathBuilder,
+    ) -> FilePathBuf {
         debug_assert!((index as usize) < self.path_components.len());
         let path_component = unsafe { *self.path_components.get_unchecked(index as usize) };
 
-        let mut string = String::with_capacity(path_component.string_len as _);
-
+        let mut string = builder.into_inner();
         build_path_string(
             || self.iter(path_component.path_component, path_component.num_components),
             path_component.string_len,
             &mut string,
         );
-
+        debug_assert!(!string.is_empty());
         unsafe { FilePathBuf::new_unchecked(string) }
-    }
-
-    #[cfg(test)]
-    fn lookup(&self, hash: PathHash) -> Option<FilePathBuf> {
-        self.path_lookup
-            .get(&hash)
-            .map(|leaf_path_component| self.path_buf(leaf_path_component.path_component_index))
     }
 }
 
