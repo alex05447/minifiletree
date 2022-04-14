@@ -160,7 +160,7 @@ where
     debug_assert_eq!(offset, 0);
 }
 
-pub(crate) fn debug_unreachable() -> ! {
+fn debug_unreachable() -> ! {
     if cfg!(debug_assertions) {
         unreachable!()
     } else {

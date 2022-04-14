@@ -649,7 +649,6 @@ impl<'a> FileTreeReader<'a> {
     /// Returns a subslice within the `data` blob at `offset` (in bytes) from the start, with `len` `T` elements.
     /// The caller guarantees `offset` and `len` are valid.
     unsafe fn slice<T>(data: &[u8], offset: u64, len: u64) -> &[T] {
-        debug_assert!(offset < data.len() as _);
         debug_assert!(offset + len * (mem::size_of::<T>() as u64) <= data.len() as _);
 
         slice::from_raw_parts(data.as_ptr().offset(offset as _) as *const _, len as _)
@@ -705,7 +704,7 @@ impl<'a, 'b> ExactSizeIterator for PathIter<'a, 'b> {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, minifilepath::FilePath, seahash::SeaHasher, std::hash::BuildHasher};
+    use {super::*, seahash::SeaHasher, std::hash::BuildHasher};
 
     struct BuildSeaHasher(SeaHasher);
 
