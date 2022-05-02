@@ -1,6 +1,5 @@
 use {
-    crate::FullStringLength,
-    minifilepath::FilePathComponent,
+    crate::*,
     std::{
         collections::{hash_map::Entry, HashMap},
         hash::Hash,
@@ -109,18 +108,17 @@ impl<K: Eq + Hash, V: Eq + Copy> MultiMap<K, V> {
     }
 }
 
-/// Takes a (non-empty, reverse) iterator builder `iter` over path components,
+/// Takes a file path iterator and known full path string length `len`,
 /// clears and fills the `string` with the full path, using `/` as separators.
 ///
 /// The caller guarantees the string built from the iterator (including the separators) is actually going to be `len` bytes long.
-pub(crate) fn build_path_string<'i, F, I>(iter: F, len: FullStringLength, string: &mut String)
-where
-    F: Fn() -> I,
-    I: ExactSizeIterator<Item = FilePathComponent<'i>>,
+pub(crate) fn build_path_string<'i, I>(
+    iter: FilePathIter<'i, I>,
+    len: FullStringLength,
+    string: &mut String,
+) where
+    I: Iterator<Item = FilePathComponent<'i>>,
 {
-    let iter = iter();
-    let num_components = iter.len();
-
     string.clear();
     string.reserve(len as _);
 
@@ -132,29 +130,43 @@ where
 
     let mut offset = len;
 
-    for (idx, component) in iter.enumerate() {
-        let first = idx == (num_components - 1);
-
+    let mut copy_str = |s: &str| {
+        let str_len = s.len() as FullStringLength;
         debug_assert!(
-            offset >= component.len() as _,
+            offset >= str_len,
             "provided and calculated string lengths mismatch"
         );
-        offset -= component.len() as FullStringLength;
+        offset -= str_len;
 
         unsafe {
             std::ptr::copy_nonoverlapping(
-                component.as_ptr(),
+                s.as_ptr(),
                 string.as_mut_ptr().offset(offset as _),
-                component.len(),
+                s.len(),
             )
         };
+    };
 
-        if !first {
-            debug_assert!(offset >= 1);
-            offset -= 1;
+    match iter.file_name {
+        FileName::WithExtension {
+            extension,
+            file_stem,
+        } => {
+            copy_str(extension);
+            copy_str(".");
 
-            *(unsafe { string.get_unchecked_mut(offset as usize) }) = b'/';
+            if let Some(file_stem) = file_stem {
+                copy_str(file_stem);
+            }
         }
+        FileName::NoExtension(file_name) => {
+            copy_str(file_name);
+        }
+    }
+
+    for component in iter.file_path {
+        copy_str("/");
+        copy_str(component);
     }
 
     debug_assert_eq!(offset, 0);

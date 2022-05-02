@@ -6,17 +6,22 @@ use {
     },
 };
 
-/// An error returned by the [`file tree writer`].
-///
-/// [`file tree writer`]: struct.FileTreeWriter.html
+/// An error returned by the [`file tree writer`](struct.FileTreeWriter.html).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum FileTreeWriterError {
-    /// A file or folder was already inserted at this file path.
-    /// Contains the path to the exisiting file or folder.
-    FileOrFolderAlreadyExistsAtFilePath(FilePathBuf),
-    /// A file was already inserted at this file or folder path.
+    /// A file was already inserted at this path.
+    PathAlreadyExists,
+    /// A folder was already inserted at this file path
+    /// (and we cannot have a folder and a file with the same name at the same path).
+    ///
+    /// E.g.: insert `"foo/bar/baz"`, where `"bar"` is a folder, followed by `"foo/bar"`, where `"bar"` is a file.
+    FolderAlreadyExistsAtFilePath,
+    /// A file was already inserted at a folder path.
     /// Contains the path to the existing file.
-    FileAlreadyExistsAtFileOrFolderPath(FilePathBuf),
+    ///
+    /// E.g.: insert `"foo/bar"`, where `"bar"` is a file, followed by `"foo/bar/baz"`, where "bar" is a folder.
+    /// `"foo/bar"` is the returned path to the existing file.
+    FileAlreadyExistsAtFolderPath(FilePathBuf),
     /// Path hash collides with an existing file path.
     /// Contains the path to the existing file.
     PathHashCollision(FilePathBuf),
@@ -29,16 +34,11 @@ impl Display for FileTreeWriterError {
         use FileTreeWriterError::*;
 
         match self {
-            FileOrFolderAlreadyExistsAtFilePath(path) => write!(
-                f,
-                "a file or folder was already inserted at file path \"{}\"",
-                path
-            ),
-            FileAlreadyExistsAtFileOrFolderPath(path) => write!(
-                f,
-                "a file was already inserted at file or folder path \"{}\"",
-                path
-            ),
+            PathAlreadyExists => "a file was already inserted at this path".fmt(f),
+            FolderAlreadyExistsAtFilePath => "a folder was already inserted at this path".fmt(f),
+            FileAlreadyExistsAtFolderPath(path) => {
+                write!(f, "a file was already inserted at folder path \"{}\"", path)
+            }
             PathHashCollision(existing) => write!(
                 f,
                 "path hash collides with existing file path \"{}\"",

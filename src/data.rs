@@ -1,7 +1,7 @@
 use {
     crate::util::*,
     static_assertions::const_assert,
-    std::{io::Write, num::NonZeroU32},
+    std::{io::Write, mem, num::NonZeroU32},
 };
 
 pub(crate) type PathComponentIndex = u32;
@@ -25,6 +25,14 @@ const_assert!((FullStringLength::MAX as usize) >= minifilepath::MAX_PATH_LEN);
 pub(crate) type NumComponents = u16;
 
 const_assert!((NumComponents::MAX as usize) >= minifilepath::MAX_NUM_COMPONENTS);
+
+// Non-highest bits in `PackedLeafPathComponent::num_components_and_is_extension`.
+const NUM_COMPONENTS_MASK: NumComponents = 0x7fff;
+
+const_assert!(minifilepath::MAX_NUM_COMPONENTS <= (NUM_COMPONENTS_MASK as usize));
+
+// Highest bit in `PackedLeafPathComponent::num_components_and_is_extension`.
+const IS_EXTENSION_MASK: NumComponents = 0x8000;
 
 const FILE_TREE_HEADER_MAGIC: u32 = 0x736b6170; // `paks`, little endian.
 
@@ -126,9 +134,9 @@ impl FileTreeHeader {
 pub(crate) struct PackedLeafPathComponent {
     /// Index of the leaf path component in the path component array for this path.
     path_component_index: PathComponentIndex,
-    /// Total number of components in this path. Non-null.
-    /// Useful to have when building the file path string from the reverse iterator over the path components.
-    num_components: NumComponents,
+    /// Total number of components in this path (including the extension, if any), non-null
+    /// and a bit (MSB) which, if set, indicates this leaf path component is for the file name extension.
+    num_components_and_is_extension: NumComponents,
     /// Total length in bytes of the string for this path (including separators).
     /// Useful to have when building the file path string from the reverse iterator over the path components.
     string_len: FullStringLength,
@@ -140,6 +148,7 @@ impl PackedLeafPathComponent {
             self.path_component_index(),
             self.num_components(),
             self.string_len(),
+            self.is_extension(),
         )
     }
 
@@ -148,7 +157,11 @@ impl PackedLeafPathComponent {
     }
 
     fn num_components(&self) -> NumComponents {
-        u16_from_bin(self.num_components)
+        u16_from_bin(self.num_components_and_is_extension) & NUM_COMPONENTS_MASK
+    }
+
+    fn is_extension(&self) -> bool {
+        u16_from_bin(self.num_components_and_is_extension) & IS_EXTENSION_MASK > 0
     }
 
     fn string_len(&self) -> FullStringLength {
@@ -157,11 +170,12 @@ impl PackedLeafPathComponent {
 }
 
 /// See `PackedLeafPathComponent`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LeafPathComponent {
     pub(crate) path_component_index: PathComponentIndex,
     pub(crate) num_components: NumComponents,
     pub(crate) string_len: FullStringLength,
+    pub(crate) is_extension: bool,
 }
 
 impl LeafPathComponent {
@@ -169,11 +183,13 @@ impl LeafPathComponent {
         path_component_index: PathComponentIndex,
         num_components: NumComponents,
         string_len: FullStringLength,
+        is_extension: bool,
     ) -> Self {
         Self {
             path_component_index,
             num_components,
             string_len,
+            is_extension,
         }
     }
 
@@ -183,8 +199,17 @@ impl LeafPathComponent {
         // Path component index.
         written += write_u32(w, self.path_component_index)?;
 
-        // Num components.
-        written += write_u16(w, self.num_components)?;
+        // Num components / is extension.
+        debug_assert!(self.num_components <= NUM_COMPONENTS_MASK);
+        written += write_u16(
+            w,
+            self.num_components & NUM_COMPONENTS_MASK
+                | if self.is_extension {
+                    IS_EXTENSION_MASK
+                } else {
+                    0
+                },
+        )?;
 
         // Total string length.
         written += write_u16(w, self.string_len)?;
@@ -278,9 +303,7 @@ impl PathComponent {
 #[repr(C, packed)]
 pub(crate) struct PackedInternedString {
     /// Packed offset in bytes to the start of the string and its length in bytes.
-    ///
-    /// Highest byte: string length, lower bytes: offset to string.
-    offset_and_len: u64,
+    offset_and_len: OffsetAndLen,
 }
 
 impl PackedInternedString {
@@ -291,16 +314,40 @@ impl PackedInternedString {
     }
 
     fn offset_and_len(&self) -> (StringOffset, ComponentStringLength) {
-        Self::unpack_offset_and_len(u64_from_bin(self.offset_and_len))
+        unpack_offset_and_len(u64_from_bin(self.offset_and_len))
     }
+}
 
-    // See `pack_offset_and_len`.
-    fn unpack_offset_and_len(offset_and_len: u64) -> (StringOffset, ComponentStringLength) {
-        (
-            offset_and_len & 0x00ff_ffff_ffff_ffffu64,
-            ((offset_and_len & 0xff00_0000_0000_0000u64) >> 56) as ComponentStringLength,
-        )
-    }
+/// Highest byte: string length, lower bytes: offset to string.
+type OffsetAndLen = u64;
+
+const OFFSET_BITS: OffsetAndLen = 56;
+const OFFSET_OFFSET: OffsetAndLen = 0;
+const MAX_OFFSET: OffsetAndLen = (1 << OFFSET_BITS) - 1;
+const OFFSET_MASK: OffsetAndLen = MAX_OFFSET << OFFSET_OFFSET;
+
+const LEN_BITS: OffsetAndLen = 8;
+const LEN_OFFSET: OffsetAndLen = OFFSET_BITS;
+const MAX_LEN: OffsetAndLen = (1 << LEN_BITS) - 1;
+const LEN_MASK: OffsetAndLen = MAX_LEN << LEN_OFFSET;
+
+const_assert!(OFFSET_BITS + LEN_BITS == (mem::size_of::<OffsetAndLen>() as OffsetAndLen) * 8);
+
+// See `pack_offset_and_len`.
+fn unpack_offset_and_len(offset_and_len: OffsetAndLen) -> (StringOffset, ComponentStringLength) {
+    (
+        ((offset_and_len & OFFSET_MASK) >> OFFSET_OFFSET) as StringOffset,
+        ((offset_and_len & LEN_MASK) >> LEN_OFFSET) as ComponentStringLength,
+    )
+}
+
+// See `unpack_offset_and_len`.
+fn pack_offset_and_len(offset: StringOffset, len: ComponentStringLength) -> OffsetAndLen {
+    // Maximum `offset` value we can encode is 56 bits, or 64 petabytes, which is more than enough.
+    debug_assert!(offset <= MAX_OFFSET);
+
+    (((len as OffsetAndLen) << LEN_OFFSET) & LEN_MASK)
+        | (((offset as OffsetAndLen) << OFFSET_OFFSET) & OFFSET_MASK)
 }
 
 /// See `PackedInternedString`.
@@ -318,7 +365,16 @@ impl InternedString {
     pub(crate) fn write<W: Write>(&self, w: &mut W, offset: u64) -> Result<usize, std::io::Error> {
         let mut written = 0;
 
-        let new_offset_and_len = Self::pack_offset_and_len(self.offset + offset, self.len);
+        let new_offset_and_len = pack_offset_and_len(
+            // Force offset `0` for empty strings.
+            if self.len == 0 {
+                debug_assert!(self.offset == 0);
+                0
+            } else {
+                self.offset + offset
+            },
+            self.len,
+        );
 
         // Offset and length.
         written += write_u64(w, new_offset_and_len)?;
@@ -326,13 +382,5 @@ impl InternedString {
         debug_assert_eq!(written, std::mem::size_of::<PackedInternedString>());
 
         Ok(written)
-    }
-
-    // See `unpack_offset_and_len`.
-    fn pack_offset_and_len(offset: StringOffset, len: ComponentStringLength) -> u64 {
-        // Maximum `offset` value we can encode is 56 bits, or 64 petabytes, which is more than enough.
-        debug_assert!(offset < 0x00ff_ffff_ffff_ffffu64);
-
-        (((len as u64) << 56) & 0xff00_0000_0000_0000u64) | (offset & 0x00ff_ffff_ffff_ffffu64)
     }
 }
