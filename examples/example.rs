@@ -101,16 +101,20 @@ fn main() -> Result<(), io::Error> {
     let num_paths = writer.len();
     let num_strings = writer.num_strings();
     let string_len = writer.string_len();
+    let num_components = writer.num_components();
+    let num_extensions = writer.num_extensions();
 
     // Serialize the written paths to the data blob.
 
     let blob = writer.write_to_vec(7)?;
 
     println!(
-        "Wrote {} paths, {} unique strings ({}b), {}b total:",
+        "Wrote {} paths, {} unique strings ({}b), {} components, {} extensions, {}b total:",
         num_paths,
         num_strings,
         string_len,
+        num_components,
+        num_extensions,
         blob.len()
     );
 

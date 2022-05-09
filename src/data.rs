@@ -1,12 +1,17 @@
 use {
     crate::util::*,
     static_assertions::const_assert,
-    std::{io::Write, mem, num::NonZeroU32},
+    std::{
+        io::{self, Write},
+        mem,
+        num::{NonZeroU16, NonZeroU32},
+    },
 };
 
 pub(crate) type PathComponentIndex = u32;
 pub(crate) type StringIndex = u32;
 pub(crate) type StringOffset = u64;
+pub(crate) type ExtensionIndex = u16;
 
 /// Maximum length in bytes of a single [`file path component`](minifilepath::FilePathComponent) string
 /// is [`MAX_COMPONENT_LEN`](minifilepath::MAX_COMPONENT_LEN), which fits in a `u8`.
@@ -26,24 +31,17 @@ pub(crate) type NumComponents = u16;
 
 const_assert!((NumComponents::MAX as usize) >= minifilepath::MAX_NUM_COMPONENTS);
 
-// Non-highest bits in `PackedLeafPathComponent::num_components_and_is_extension`.
-const NUM_COMPONENTS_MASK: NumComponents = 0x7fff;
-
-const_assert!(minifilepath::MAX_NUM_COMPONENTS <= (NUM_COMPONENTS_MASK as usize));
-
-// Highest bit in `PackedLeafPathComponent::num_components_and_is_extension`.
-const IS_EXTENSION_MASK: NumComponents = 0x8000;
-
 const FILE_TREE_HEADER_MAGIC: u32 = 0x736b6170; // `paks`, little endian.
 
 /// File tree data blob header.
 ///
 /// File tree data blob layout:
 ///
-/// | Header                    | `FileTreeHeader`              | 24b                           |
+/// | Header                    | `FileTreeHeader`              | 32b                           |
 /// | Path hashes               | `[PathHash]`                  | 8b * `lookup_len`             |
 /// | Leaf path components      | `[PackedLeafPathComponent]`   | 8b * `lookup_len`             |
 /// | Path components           | `[PackedPathComponent]`       | 8b * `path_components_len`    |
+/// | Extensions                | `[StringIndex]`               | 4b * `extensions_len`         |
 /// | String table              | `[PackedInternedString]`      | 8b * `string_table_len`       |
 /// | Strings                   | Contiguous UTF-8 string       | rest of the file              |
 ///
@@ -59,6 +57,9 @@ pub(crate) struct FileTreeHeader {
     path_components_len: PathComponentIndex,
     /// Length of the string table in elements.
     string_table_len: StringIndex,
+    /// Length of the extension table in elements.
+    extension_table_len: ExtensionIndex,
+    _padding: [ExtensionIndex; 3],
     /// Opaque user-provided "version" / user data information.
     version: u64,
 }
@@ -68,6 +69,7 @@ impl FileTreeHeader {
         lookup_len: PathComponentIndex,
         path_components_len: PathComponentIndex,
         string_table_len: StringIndex,
+        extension_table_len: ExtensionIndex,
         version: u64,
     ) -> Self {
         Self {
@@ -75,12 +77,16 @@ impl FileTreeHeader {
             lookup_len,
             path_components_len,
             string_table_len,
+            extension_table_len,
+            _padding: [0; 3],
             version,
         }
     }
 
     pub(crate) fn check_magic(&self) -> bool {
-        u32_from_bin(self.magic) == FILE_TREE_HEADER_MAGIC
+        (u32_from_bin(self.magic) == FILE_TREE_HEADER_MAGIC)
+        // Also check the padding.
+        && (self._padding[0] == 0 && self._padding[1] == 0 && self._padding[2] == 0)
     }
 
     pub(crate) fn lookup_len(&self) -> PathComponentIndex {
@@ -89,6 +95,10 @@ impl FileTreeHeader {
 
     pub(crate) fn path_components_len(&self) -> PathComponentIndex {
         u32_from_bin(self.path_components_len)
+    }
+
+    pub(crate) fn extension_table_len(&self) -> ExtensionIndex {
+        u16_from_bin(self.extension_table_len)
     }
 
     pub(crate) fn string_table_len(&self) -> StringIndex {
@@ -114,16 +124,22 @@ impl FileTreeHeader {
         // String table length.
         written += write_u32(w, self.string_table_len)?;
 
+        // Extension table length and padding.
+        written += write_u16(w, self.extension_table_len)?;
+        written += write_u16(w, 0)?;
+        written += write_u16(w, 0)?;
+        written += write_u16(w, 0)?;
+
         // Version.
         written += write_u64(w, self.version)?;
 
-        debug_assert_eq!(written, std::mem::size_of::<Self>());
+        debug_assert_eq!(written, mem::size_of::<Self>());
 
         Ok(written)
     }
 }
 
-/// Corresponds to a single leaf node of the file tree (i.e. a file).
+/// Corresponds to a single leaf node of the file tree (i.e. a file name).
 ///
 /// Written to the file tree binary data blob as an element in the lookup table value array.
 ///
@@ -133,10 +149,15 @@ impl FileTreeHeader {
 #[repr(C, packed)]
 pub(crate) struct PackedLeafPathComponent {
     /// Index of the leaf path component in the path component array for this path.
-    path_component_index: PathComponentIndex,
-    /// Total number of components in this path (including the extension, if any), non-null
-    /// and a bit (MSB) which, if set, indicates this leaf path component is for the file name extension.
-    num_components_and_is_extension: NumComponents,
+    /// For paths without extensions (`extension` is `None`), this is the index of the file name path component.
+    /// For paths with extensions (`extension` is `Some`), this is the index of the file stem path component instead.
+    path_component: PathComponentIndex,
+    /// (Optional) index of this path's extension in the extension table.
+    /// `None` for file names without an extension.
+    /// Stored as an optional non-zero integer for space efficiency;
+    /// decrement by one to get the actual lookup index.
+    /// Also see `PackedPathComponent::parent`.
+    extension: Option<NonZeroU16>,
     /// Total length in bytes of the string for this path (including separators).
     /// Useful to have when building the file path string from the reverse iterator over the path components.
     string_len: FullStringLength,
@@ -144,24 +165,19 @@ pub(crate) struct PackedLeafPathComponent {
 
 impl PackedLeafPathComponent {
     pub(crate) fn unpack(&self) -> LeafPathComponent {
-        LeafPathComponent::new(
-            self.path_component_index(),
-            self.num_components(),
-            self.string_len(),
-            self.is_extension(),
-        )
+        LeafPathComponent::new(self.path_component(), self.extension(), self.string_len())
     }
 
-    fn path_component_index(&self) -> PathComponentIndex {
-        u32_from_bin(self.path_component_index)
+    fn path_component(&self) -> PathComponentIndex {
+        u32_from_bin(self.path_component)
     }
 
-    fn num_components(&self) -> NumComponents {
-        u16_from_bin(self.num_components_and_is_extension) & NUM_COMPONENTS_MASK
-    }
-
-    fn is_extension(&self) -> bool {
-        u16_from_bin(self.num_components_and_is_extension) & IS_EXTENSION_MASK > 0
+    /// NOTE - this does the `-1` subtraction.
+    fn extension(&self) -> Option<ExtensionIndex> {
+        self.extension
+            .map(NonZeroU16::get)
+            .map(u16_from_bin)
+            .map(|x| (x - 1) as ExtensionIndex)
     }
 
     fn string_len(&self) -> FullStringLength {
@@ -172,24 +188,21 @@ impl PackedLeafPathComponent {
 /// See `PackedLeafPathComponent`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LeafPathComponent {
-    pub(crate) path_component_index: PathComponentIndex,
-    pub(crate) num_components: NumComponents,
+    pub(crate) path_component: PathComponentIndex,
+    pub(crate) extension: Option<ExtensionIndex>,
     pub(crate) string_len: FullStringLength,
-    pub(crate) is_extension: bool,
 }
 
 impl LeafPathComponent {
     pub(crate) fn new(
-        path_component_index: PathComponentIndex,
-        num_components: NumComponents,
+        path_component: PathComponentIndex,
+        extension: Option<ExtensionIndex>,
         string_len: FullStringLength,
-        is_extension: bool,
     ) -> Self {
         Self {
-            path_component_index,
-            num_components,
+            path_component,
             string_len,
-            is_extension,
+            extension,
         }
     }
 
@@ -197,18 +210,14 @@ impl LeafPathComponent {
         let mut written = 0;
 
         // Path component index.
-        written += write_u32(w, self.path_component_index)?;
+        written += write_u32(w, self.path_component)?;
 
-        // Num components / is extension.
-        debug_assert!(self.num_components <= NUM_COMPONENTS_MASK);
+        // Extension index.
         written += write_u16(
             w,
-            self.num_components & NUM_COMPONENTS_MASK
-                | if self.is_extension {
-                    IS_EXTENSION_MASK
-                } else {
-                    0
-                },
+            self.extension
+                .map(|extension_index| (extension_index + 1) as u16)
+                .unwrap_or(0),
         )?;
 
         // Total string length.
@@ -221,6 +230,8 @@ impl LeafPathComponent {
 }
 
 /// Represents a unique component of a path (i.e. a unique file tree node).
+/// Used for folder names, file names (without extension), file stems.
+/// Extensions do not have path components representing them and are deduplicated and stored/indexed separately.
 ///
 /// Written to the file tree binary data blob as an element in the path component array section.
 ///
@@ -229,27 +240,28 @@ impl LeafPathComponent {
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(C, packed)]
 pub(crate) struct PackedPathComponent {
-    /// Index of the path component's string in the string table / lookup array.
-    string_index: StringIndex,
+    /// Index of the path component's string in the string table.
+    string: StringIndex,
     /// (Optional) index of the parent path component in path components lookup array.
     /// `None` for root file tree elements, `Some` for non-root elements.
     /// Stored as an optional non-zero integer for space efficiency;
     /// decrement by one to get the actual lookup index.
-    parent_index: Option<NonZeroU32>,
+    /// Also see `PackedLeafPathComponent::extension`.
+    parent: Option<NonZeroU32>,
 }
 
 impl PackedPathComponent {
     pub(crate) fn unpack(&self) -> PathComponent {
-        PathComponent::new(self.string_index(), self.parent_index())
+        PathComponent::new(self.string(), self.parent())
     }
 
-    fn string_index(&self) -> StringIndex {
-        u32_from_bin(self.string_index)
+    fn string(&self) -> StringIndex {
+        u32_from_bin(self.string)
     }
 
     /// NOTE - this does the `-1` subtraction.
-    fn parent_index(&self) -> Option<PathComponentIndex> {
-        self.parent_index
+    fn parent(&self) -> Option<PathComponentIndex> {
+        self.parent
             .map(NonZeroU32::get)
             .map(u32_from_bin)
             .map(|x| x - 1)
@@ -259,43 +271,35 @@ impl PackedPathComponent {
 /// See `PackedPathComponent`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PathComponent {
-    pub(crate) string_index: StringIndex,
-    pub(crate) parent_index: Option<PathComponentIndex>,
+    pub(crate) string: StringIndex,
+    pub(crate) parent: Option<PathComponentIndex>,
 }
 
 impl PathComponent {
-    pub(crate) fn new(string_index: StringIndex, parent_index: Option<PathComponentIndex>) -> Self {
-        Self {
-            string_index,
-            parent_index,
-        }
+    pub(crate) fn new(string: StringIndex, parent: Option<PathComponentIndex>) -> Self {
+        Self { string, parent }
     }
 
-    pub(crate) fn write<W: Write>(&self, w: &mut W) -> Result<usize, std::io::Error> {
+    pub(crate) fn write<W: Write>(&self, w: &mut W) -> Result<usize, io::Error> {
         let mut written = 0;
 
         // String index.
-        written += write_u32(w, self.string_index)?;
+        written += write_u32(w, self.string)?;
 
         // Parent index.
-        written += write_u32(
-            w,
-            self.parent_index
-                .map(|parent_index| parent_index + 1)
-                .unwrap_or(0),
-        )?;
+        written += write_u32(w, self.parent.map(|parent| parent + 1).unwrap_or(0))?;
 
-        debug_assert_eq!(written, std::mem::size_of::<PackedPathComponent>());
+        debug_assert_eq!(written, mem::size_of::<PackedPathComponent>());
 
         Ok(written)
     }
 }
 
-/// Offset and (non-null) length in bytes of a unique string in the string section
-/// (either w.r.t. the string section itself, when writing, or w.r.t. the full data blob, when reading).
-/// Each string represents a unique [`file path component`](minifilepath::FilePathComponent).
+/// Offset and (non-null) length in bytes of a unique string in the string section.
+/// Offset is either w.r.t. the string section itself, when writing, or w.r.t. the full data blob, when reading.
+/// Each string represents a unique [`file path component`](minifilepath::FilePathComponent), or a file stem / extension.
 ///
-/// Written to the file tree binary data blob as an element in the string table / lookup array section.
+/// Written to the file tree binary data blob as an element in the string table section.
 ///
 /// Fields are in whatever endianness we use; see `u64_from_bin()`.
 /// See `InternedString`.
@@ -309,7 +313,6 @@ pub(crate) struct PackedInternedString {
 impl PackedInternedString {
     pub(crate) fn unpack(&self) -> InternedString {
         let (offset, len) = self.offset_and_len();
-
         InternedString::new(offset, len)
     }
 
@@ -362,6 +365,8 @@ impl InternedString {
         Self { offset, len }
     }
 
+    /// Write the internded string to the writer, patching up its offset by the provided `offset` value
+    /// (i.e. the start of the string section in the file tree data blob when writing the file tree).
     pub(crate) fn write<W: Write>(&self, w: &mut W, offset: u64) -> Result<usize, std::io::Error> {
         let mut written = 0;
 
@@ -379,7 +384,7 @@ impl InternedString {
         // Offset and length.
         written += write_u64(w, new_offset_and_len)?;
 
-        debug_assert_eq!(written, std::mem::size_of::<PackedInternedString>());
+        debug_assert_eq!(written, mem::size_of::<PackedInternedString>());
 
         Ok(written)
     }

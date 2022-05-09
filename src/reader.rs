@@ -1,10 +1,10 @@
 use {
     crate::*,
-    minifilepath::{is_valid_path_component, FilePathBuf, FilePathBuilder, MAX_NUM_COMPONENTS},
+    minifilepath::{is_valid_path_component, FilePathBuf, FilePathBuilder},
     ministr::NonEmptyStr,
     std::{
         collections::{HashMap, HashSet},
-        iter::{ExactSizeIterator, Iterator},
+        iter::Iterator,
         mem, slice, str,
     },
 };
@@ -34,6 +34,7 @@ impl<'a> FileTreeReader<'a> {
     /// Unsafe because no validation is performed of the `data` blob.
     /// The caller guarantees that `data` is a valid file tree data blob (i.e. [`is_valid`](#method.is_valid) returned `true` for it).
     pub unsafe fn new_unchecked(data: &'a [u8]) -> Self {
+        // TODO: still doing a sanity check in debug configuration just in case. Remove if/when this becomes an issue.
         debug_assert!(
             Self::validate_blob(data),
             "tried to create a `FileTreeReader` from an invalid data blob"
@@ -57,13 +58,13 @@ impl<'a> FileTreeReader<'a> {
 
             let lookup_len = header.lookup_len();
 
-            let lookup_keys = unsafe { Self::lookup_keys(self.data, lookup_len) };
-            let lookup_values = unsafe { Self::lookup_values(self.data, lookup_len) };
+            let path_hashes = unsafe { Self::path_hashes(self.data, lookup_len) };
+            let lpcs = unsafe { Self::leaf_path_components(self.data, lookup_len) };
 
             self.lookup.replace(
-                lookup_keys
+                path_hashes
                     .iter()
-                    .zip(lookup_values.iter())
+                    .zip(lpcs.iter())
                     .map(|(k, v)| (u64_from_bin(*k), v.unpack()))
                     .collect(),
             );
@@ -84,25 +85,28 @@ impl<'a> FileTreeReader<'a> {
         header.lookup_len() as _
     }
 
+    /*
     /// Returns the number of unique interned strings in the reader.
     pub fn num_strings(&self) -> usize {
         let header = unsafe { Self::header(self.data) };
 
         header.string_table_len() as _
     }
+    */
 
     /// Returns the total length in bytes of all unique interned strings in the reader.
-    pub fn string_len(&self) -> usize {
+    pub fn string_len(&self) -> u64 {
         let header = unsafe { Self::header(self.data) };
 
         let string_section_start = Self::string_section_start(
             header.lookup_len(),
             header.path_components_len(),
+            header.extension_table_len(),
             header.string_table_len(),
         );
-        debug_assert!(string_section_start < self.data.len());
+        debug_assert!(string_section_start < self.data.len() as u64);
 
-        let string_section_end = self.data.len();
+        let string_section_end = self.data.len() as u64;
 
         string_section_end - string_section_start
     }
@@ -112,7 +116,7 @@ impl<'a> FileTreeReader<'a> {
     pub fn lookup_iter(
         &self,
         hash: PathHash,
-    ) -> Option<FilePathIter<'_, impl ExactSizeIterator<Item = FilePathComponent<'_>>>> {
+    ) -> Option<FilePathIter<'_, impl Iterator<Item = FilePathComponent<'_>>>> {
         let header = unsafe { Self::header(self.data) };
 
         self.lookup_leaf_path_component(header, hash)
@@ -141,13 +145,19 @@ impl<'a> FileTreeReader<'a> {
         self.lookup_into(hash, FilePathBuilder::new()).ok()
     }
 
+    /// The caller guarantees the `data` is at least large enough to hold a `FileTreeHeader`.
+    unsafe fn header(data: &[u8]) -> &FileTreeHeader {
+        &*(data.as_ptr() as *const _)
+    }
+
     // Attempts to validate the `data` to make sure it is a valid file tree blob, written by the `FileTreeWriter`.
     fn validate_blob(data: &[u8]) -> bool {
         // Check if the data is at least large enough to hold the smallest possible file tree blob.
-        if data.len() < Self::min_size() {
+        if (data.len() as u64) < Self::min_size() {
             return false;
         }
 
+        // Safe because we made sure the `data` is large enough for at least a header.
         let header = unsafe { Self::header(data) };
 
         // Check the header magic.
@@ -157,16 +167,33 @@ impl<'a> FileTreeReader<'a> {
 
         let lookup_len = header.lookup_len();
         let path_components_len = header.path_components_len();
+        let extension_table_len = header.extension_table_len();
+        let string_table_len = header.string_table_len();
 
-        // Must have at least as many (or more) path components as there are lookup entries.
+        // Must have at least as many (or more) path components as there are leaf path components.
         if path_components_len < lookup_len {
             return false;
         }
 
-        let string_table_len = header.string_table_len();
+        // Must have as many (or more) leaf path components as there are extensions.
+        if lookup_len < extension_table_len as _ {
+            return false;
+        }
+
+        // Must have at least as many (or more) path components as there are strings.
+        if path_components_len < string_table_len {
+            return false;
+        }
 
         // Must be large enough to accomodate the section lengths from the header.
-        if data.len() < Self::required_size(lookup_len, path_components_len, string_table_len) {
+        if (data.len() as u64)
+            < Self::required_size(
+                lookup_len,
+                path_components_len,
+                extension_table_len,
+                string_table_len,
+            )
+        {
             return false;
         }
 
@@ -182,26 +209,57 @@ impl<'a> FileTreeReader<'a> {
         */
 
         // Assume the path components are valid.
+        // Safe because we made sure the `data` is large enough.
         let path_components =
             unsafe { Self::path_components(data, lookup_len, path_components_len) };
 
         for path_component in path_components.iter().map(PackedPathComponent::unpack) {
             // Make sure all string indices are within the valid range.
-            if path_component.string_index >= string_table_len {
+            if path_component.string >= string_table_len {
                 return false;
             }
 
             // Make sure all parent indices are within the valid range.
-            if let Some(parent_index) = path_component.parent_index {
-                if parent_index >= path_components_len {
+            if let Some(parent) = path_component.parent {
+                if parent >= path_components_len {
                     return false;
                 }
             }
         }
 
+        // Assume the extensions are valid.
+        // Safe because we made sure the `data` is large enough.
+        let extension_table = unsafe {
+            Self::extension_table(data, lookup_len, path_components_len, extension_table_len)
+        };
+
+        // Make sure all extension string indices are within the valid range.
+        if extension_table
+            .iter()
+            .any(|&extension| extension >= string_table_len)
+        {
+            return false;
+        }
+
+        /*
+            // All entries must be unique.
+            #[cfg(debug_assertions)]
+            if Self::has_duplicates_quadratic(extension_table) {
+                return false;
+            }
+        */
+
         // Assume the string table is valid.
-        let string_table =
-            unsafe { Self::string_table(data, lookup_len, path_components_len, string_table_len) };
+        // Safe because we made sure the `data` is large enough.
+        let string_table = unsafe {
+            Self::string_table(
+                data,
+                lookup_len,
+                path_components_len,
+                extension_table_len,
+                string_table_len,
+            )
+        };
 
         /*
                 // All entries must be unique.
@@ -211,11 +269,15 @@ impl<'a> FileTreeReader<'a> {
                 }
         */
 
-        let string_section_start =
-            Self::string_section_start(lookup_len, path_components_len, string_table_len);
-        debug_assert!(string_section_start < data.len());
+        let string_section_start = Self::string_section_start(
+            lookup_len,
+            path_components_len,
+            extension_table_len,
+            string_table_len,
+        );
+        debug_assert!(string_section_start < data.len() as StringOffset);
 
-        let string_section_end = data.len();
+        let string_section_end = data.len() as StringOffset;
 
         for string in string_table.iter().map(PackedInternedString::unpack) {
             // Empty strings are allowed (empty file stems), and must have offset == `0`.
@@ -229,7 +291,7 @@ impl<'a> FileTreeReader<'a> {
                     return false;
                 }
 
-                if string.offset + string.len as StringOffset > string_section_end as StringOffset {
+                if string.offset + string.len as StringOffset > string_section_end {
                     return false;
                 }
             }
@@ -239,7 +301,7 @@ impl<'a> FileTreeReader<'a> {
                 str::from_utf8(unsafe { Self::slice(data, string.offset, string.len as _) })
             {
                 if let Some(string) = NonEmptyStr::new(string) {
-                    // Make sure all path components are valid.
+                    // Make sure all strings are valid path components.
                     if !is_valid_path_component(string) {
                         return false;
                     }
@@ -250,7 +312,8 @@ impl<'a> FileTreeReader<'a> {
         }
 
         // Assume the lookup values (leaf path components) are valid.
-        let lpcs = unsafe { Self::lookup_values(data, lookup_len) };
+        // Safe because we made sure the `data` is large enough.
+        let lpcs = unsafe { Self::leaf_path_components(data, lookup_len) };
 
         /*
                 // All entries must be unique.
@@ -262,118 +325,93 @@ impl<'a> FileTreeReader<'a> {
 
         let string_section_len = string_section_end - string_section_start;
 
-        // Used to detect loops in the file path tree.
-        let mut visited_path_components = HashSet::<PathComponentIndex>::new();
+        // Used to detect loops in the file tree.
+        let mut visited_components = HashSet::<PathComponentIndex>::new();
 
         for lpc in lpcs.iter().map(PackedLeafPathComponent::unpack) {
             // Make sure all path component indices are within the valid range.
-            let path_component_index = lpc.path_component_index;
-
-            if path_component_index >= path_components_len {
+            if lpc.path_component >= path_components_len {
                 return false;
             }
 
-            let num_components = lpc.num_components;
-
-            // Empty paths are invalid.
-            if num_components == 0 {
-                return false;
+            // Make sure all extension indices are within the valid range.
+            if let Some(extension) = lpc.extension {
+                if extension > extension_table_len {
+                    return false;
+                }
             }
 
-            // Paths with an extension have at least 2 components (extension and file stem).
-            if lpc.is_extension && num_components < 2 {
-                return false;
-            }
-
-            if num_components as usize > MAX_NUM_COMPONENTS {
-                return false;
-            }
-
-            // Number of components for the path cannot be greater than the total number of unique components in the file tree.
-            if num_components as PathComponentIndex > path_components_len {
-                return false;
-            }
-
-            let lpc_len = lpc.string_len;
-            // "foo/bar" -> 2 components, 1 separator
-            // "foo/bar.txt" -> 3 components, 2 separators
-            let num_separators = num_components - 1;
-            let min_lpc_len = num_components + num_separators;
-
-            // String length for the path cannot be less than the minimum (1 byte per component + separators).
-            if lpc_len < min_lpc_len {
-                return false;
-            }
-
-            // String length for the path (excluding the separators) cannot be greater than the total string section length.
-            debug_assert!(lpc_len > num_separators);
-            let lpc_len_without_separators = lpc_len - num_separators;
-
-            if lpc_len_without_separators as usize > string_section_len {
+            if (lpc.string_len as StringOffset) > string_section_len {
                 return false;
             }
 
             // Check for cycles starting at this leaf path component.
             // Validate that extension components have file stem components.
             {
-                visited_path_components.clear();
+                visited_components.clear();
 
-                // Num components and string length obtained from iterating the path must match its declared properties.
-                let mut actual_num_components: NumComponents = 1;
+                // String length obtained from iterating the path must match its declared value.
                 let mut actual_len: FullStringLength = 0;
 
-                let mut path_component_index = path_component_index;
-                visited_path_components.insert(path_component_index);
+                let mut cur_path_component = lpc.path_component;
+                visited_components.insert(cur_path_component);
 
                 let mut first = true;
 
                 loop {
-                    debug_assert!((path_component_index as usize) < path_components.len());
+                    // Safe because we made sure all component indices are valid.
+                    debug_assert!((cur_path_component as usize) < path_components.len());
                     let path_component =
-                        unsafe { path_components.get_unchecked(path_component_index as usize) }
+                        unsafe { path_components.get_unchecked(cur_path_component as usize) }
                             .unpack();
 
-                    // Extension path components must have a parent path component (file stem).
+                    // Check the extension, if any.
                     if first {
-                        if lpc.is_extension && path_component.parent_index.is_none() {
-                            return false;
+                        if let Some(extension) = lpc.extension {
+                            // Safe because we made sure all extension indices are valid.
+                            debug_assert!(extension < extension_table_len);
+                            let extension_string_index =
+                                Self::extension_string_index_impl(data, header, extension);
+                            // Safe because we made sure all extension string indices are valid.
+                            debug_assert!(extension_string_index < string_table_len);
+                            let extension_string = unsafe {
+                                string_table.get_unchecked(extension_string_index as usize)
+                            }
+                            .unpack();
+                            actual_len += extension_string.len as FullStringLength;
+                            // Count the dot.
+                            actual_len += 1;
                         }
 
                         first = false;
                     }
 
-                    debug_assert!(path_component.string_index < string_table_len);
+                    // Safe because we made sure all string indices are valid.
+                    debug_assert!(path_component.string < string_table_len);
                     let string =
-                        unsafe { string_table.get_unchecked(path_component.string_index as usize) }
+                        unsafe { string_table.get_unchecked(path_component.string as usize) }
                             .unpack();
 
                     actual_len += string.len as FullStringLength;
 
                     // If the path component has a parent, keep processing.
-                    if let Some(parent_index) = path_component.parent_index {
-                        debug_assert!(parent_index < path_components_len);
-
+                    if let Some(parent) = path_component.parent {
                         // Cycles are not allowed.
-                        if !visited_path_components.insert(parent_index) {
+                        if !visited_components.insert(parent) {
                             return false;
                         }
 
-                        actual_num_components += 1;
-                        path_component_index = parent_index;
+                        cur_path_component = parent;
                         // Count the separator character.
                         actual_len += 1;
 
-                    // Otherwise we've reached the root of the path; time to check whether num components / string length match.
+                    // Otherwise we've reached the root of the path; time to check whether string lengths match.
                     } else {
                         break;
                     }
                 }
 
-                if actual_num_components != num_components {
-                    return false;
-                }
-
-                if actual_len != lpc_len {
+                if actual_len != lpc.string_len {
                     return false;
                 }
             }
@@ -397,17 +435,18 @@ impl<'a> FileTreeReader<'a> {
         } else {
             let lookup_len = header.lookup_len();
 
-            let lookup_keys = unsafe { Self::lookup_keys(self.data, lookup_len) };
+            let path_hashes = unsafe { Self::path_hashes(self.data, lookup_len) };
 
-            if let Some(idx) = lookup_keys
+            if let Some(idx) = path_hashes
                 .iter()
                 .cloned()
                 .map(u64_from_bin)
+                // TODO: binary search.
                 .position(|key| key == hash)
             {
-                let lookup_values = unsafe { Self::lookup_values(self.data, lookup_len) };
-                debug_assert!(idx < lookup_values.len());
-                Some(unsafe { lookup_values.get_unchecked(idx) }.unpack())
+                let lpcs = unsafe { Self::leaf_path_components(self.data, lookup_len) };
+                debug_assert!(idx < lpcs.len());
+                Some(unsafe { lpcs.get_unchecked(idx) }.unpack())
             } else {
                 None
             }
@@ -433,43 +472,32 @@ impl<'a> FileTreeReader<'a> {
         &self,
         header: &FileTreeHeader,
         lpc: LeafPathComponent,
-    ) -> FilePathIter<'_, impl ExactSizeIterator<Item = FilePathComponent<'_>>> {
-        let mut path_component = self.path_component_impl(header, lpc.path_component_index);
-        let mut num_components = lpc.num_components;
+    ) -> FilePathIter<'_, impl Iterator<Item = FilePathComponent<'_>>> {
+        let path_component = self.path_component_impl(header, lpc.path_component);
 
-        let file_name = if lpc.is_extension {
-            // Paths with an extension have at least 2 components (extension and file stem).
-            debug_assert!(num_components >= 2);
-            num_components -= 2;
+        let file_name = if let Some(extension_index) = lpc.extension {
             // Extensions may not be empty.
-            let extension = self.non_empty_string(path_component.string_index);
-            // Leaf path components with an extension have a parent component (file stem).
-            let parent_index = unsafe { debug_unwrap(path_component.parent_index) };
-            path_component = self.path_component_impl(header, parent_index);
+            let extension = self.non_empty_string(self.extension_string_index(extension_index));
+            // For leaf path components with an extension, `path_component` is for the file stem.
             // File stems may be empty.
-            let file_stem = NonEmptyStr::new(self.string(path_component.string_index));
+            let file_stem = NonEmptyStr::new(self.string(path_component.string));
 
             FileName::WithExtension {
                 extension,
                 file_stem,
             }
         } else {
-            // Empty paths are invalid.
-            debug_assert!(num_components >= 1);
-            num_components -= 1;
-
             // File names (with no extension) may not be empty.
-            FileName::NoExtension(self.non_empty_string(path_component.string_index))
+            FileName::NoExtension(self.non_empty_string(path_component.string))
         };
 
         FilePathIter {
             file_name,
-            file_path: PathIter::new(
+            file_path: FolderIter::new(
                 self,
                 path_component
-                    .parent_index
-                    .map(|parent_index| self.path_component_impl(header, parent_index)),
-                num_components,
+                    .parent
+                    .map(|parent| self.path_component_impl(header, parent)),
             ),
         }
     }
@@ -503,10 +531,11 @@ impl<'a> FileTreeReader<'a> {
                     self.data,
                     header.lookup_len(),
                     header.path_components_len(),
+                    header.extension_table_len(),
                     header.string_table_len(),
                 )
             };
-            debug_assert!(index < string_table.len() as _);
+            debug_assert!((index as usize) < string_table.len());
             unsafe { string_table.get_unchecked(index as usize) }.unpack()
         };
 
@@ -516,62 +545,209 @@ impl<'a> FileTreeReader<'a> {
     /// The caller guarantees the string `index` is valid,
     /// and that the string at `index` is non-empty (file stems may be empty).
     fn non_empty_string(&self, index: StringIndex) -> &NonEmptyStr {
-        let res = self.string(index);
-        debug_assert!(!res.is_empty());
-        unsafe { NonEmptyStr::new_unchecked(res) }
+        let s = self.string(index);
+        debug_assert!(!s.is_empty());
+        unsafe { NonEmptyStr::new_unchecked(s) }
     }
 
-    /// Calculates the size in bytes of the lookup keys array given the lookup length from the header.
-    const fn lookup_keys_size(lookup_len: PathComponentIndex) -> usize {
-        mem::size_of::<PathHash>() * lookup_len as usize
+    /// The caller guarantees the extension `index` is valid,
+    fn extension_string_index(&self, index: ExtensionIndex) -> StringIndex {
+        let header = unsafe { Self::header(self.data) };
+        Self::extension_string_index_impl(self.data, header, index)
     }
 
-    /// Calculates the size in bytes of the lookup values array given the lookup length from the header.
-    const fn lookup_values_size(lookup_len: PathComponentIndex) -> usize {
-        mem::size_of::<PackedLeafPathComponent>() * lookup_len as usize
+    /// The caller guarantees the extension `index` is valid,
+    fn extension_string_index_impl(
+        data: &[u8],
+        header: &FileTreeHeader,
+        index: ExtensionIndex,
+    ) -> StringIndex {
+        let extension_table = unsafe {
+            Self::extension_table(
+                data,
+                header.lookup_len(),
+                header.path_components_len(),
+                header.extension_table_len(),
+            )
+        };
+        debug_assert!((index as usize) < extension_table.len());
+        *unsafe { extension_table.get_unchecked(index as usize) }
+    }
+
+    /// Calculates the offset in bytes from the start of the file tree data blob to the array of path hashes / lookup keys.
+    const fn path_hashes_offset() -> u64 {
+        // |Header|Path hashes|Leaf path components|Path components|Extension table|String table|Strings|
+        //        ^
+        //        |
+        mem::size_of::<FileTreeHeader>() as _
+    }
+
+    /// Calculates the size in bytes of the path hashes / lookup keys array given the lookup length from the header.
+    const fn path_hashes_size(lookup_len: PathComponentIndex) -> u64 {
+        (lookup_len as u64) * (mem::size_of::<PathHash>() as u64)
+    }
+
+    /// Returns the subslice of lookup keys (path hashes) from the `data` blob.
+    /// The caller guarantees `lookup_len` is valid for the `data` blob.
+    unsafe fn path_hashes<'d>(data: &'d [u8], lookup_len: PathComponentIndex) -> &'d [PathHash] {
+        Self::slice(data, Self::path_hashes_offset(), lookup_len as _)
+    }
+
+    /// Calculates the offset in bytes from the start of the file tree data blob to the array of lookup values.
+    const fn leaf_path_components_offset(lookup_len: PathComponentIndex) -> u64 {
+        // |Header|Path hashes|Leaf path components|Path components|Extension table|String table|Strings|
+        //                    ^
+        //                    |
+        Self::path_hashes_offset() + Self::path_hashes_size(lookup_len)
+    }
+
+    /// Calculates the size in bytes of the leaf path components / lookup values array given the lookup length from the header.
+    const fn leaf_path_components_size(lookup_len: PathComponentIndex) -> u64 {
+        (lookup_len as u64) * (mem::size_of::<PackedLeafPathComponent>() as u64)
+    }
+
+    /// Returns the subslice of lookup values (leaf path components) from the `data` blob.
+    /// The caller guarantees `lookup_len` is valid for the `data` blob.
+    unsafe fn leaf_path_components<'d>(
+        data: &'d [u8],
+        lookup_len: PathComponentIndex,
+    ) -> &'d [PackedLeafPathComponent] {
+        Self::slice(
+            data,
+            Self::leaf_path_components_offset(lookup_len),
+            lookup_len as _,
+        )
+    }
+
+    /// Calculates the offset in bytes from the start of the file tree data blob to the array of path components.
+    const fn path_components_offset(lookup_len: PathComponentIndex) -> u64 {
+        // |Header|Path hashes|Leaf path components|Path components|Extension table|String table|Strings|
+        //                                         ^
+        //                                         |
+        Self::leaf_path_components_offset(lookup_len) + Self::leaf_path_components_size(lookup_len)
     }
 
     /// Calculates the size in bytes of the path components array given its length from the header.
-    const fn path_component_table_size(path_components_len: PathComponentIndex) -> usize {
-        mem::size_of::<PackedPathComponent>() * path_components_len as usize
+    const fn path_components_size(path_components_len: PathComponentIndex) -> u64 {
+        (path_components_len as u64) * (mem::size_of::<PackedPathComponent>() as u64)
+    }
+
+    /// Returns the subslice of path components from the `data` blob.
+    /// The caller guarantees `lookup_len` and `path_components_len` are valid for the `data` blob.
+    unsafe fn path_components(
+        data: &[u8],
+        lookup_len: PathComponentIndex,
+        path_components_len: PathComponentIndex,
+    ) -> &[PackedPathComponent] {
+        Self::slice(
+            data,
+            Self::path_components_offset(lookup_len),
+            path_components_len as _,
+        )
+    }
+
+    const fn extension_table_offset(
+        lookup_len: PathComponentIndex,
+        path_components_len: PathComponentIndex,
+    ) -> u64 {
+        // |Header|Path hashes|Leaf path components|Path components|Extension table|String table|Strings|
+        //                                                         ^
+        //                                                         |
+        Self::path_components_offset(lookup_len) + Self::path_components_size(path_components_len)
+    }
+
+    /// Calculates the size in bytes of the extension table given its length from the header.
+    const fn extension_table_size(extension_table_len: ExtensionIndex) -> u64 {
+        (mem::size_of::<StringIndex>() as u64) * (extension_table_len as u64)
+    }
+
+    unsafe fn extension_table(
+        data: &[u8],
+        lookup_len: PathComponentIndex,
+        path_components_len: PathComponentIndex,
+        extension_table_len: ExtensionIndex,
+    ) -> &[StringIndex] {
+        Self::slice(
+            data,
+            Self::extension_table_offset(lookup_len, path_components_len),
+            extension_table_len as _,
+        )
+    }
+
+    /// Calculates the offset in bytes from the start of the file tree data blob to the string table.
+    const fn string_table_offset(
+        lookup_len: PathComponentIndex,
+        path_components_len: PathComponentIndex,
+        extension_table_len: ExtensionIndex,
+    ) -> u64 {
+        // |Header|Path hashes|Leaf path components|Path components|Extension table|String table|Strings|
+        //                                                                         ^
+        //                                                                         |
+        let offset = Self::extension_table_offset(lookup_len, path_components_len)
+            + Self::extension_table_size(extension_table_len);
+        // Align to 8b.
+        (offset + 7) / 8 * 8
     }
 
     /// Calculates the size in bytes of the string table given its length from the header.
-    const fn string_table_size(string_table_len: StringIndex) -> usize {
-        mem::size_of::<PackedInternedString>() * string_table_len as usize
+    const fn string_table_size(string_table_len: StringIndex) -> u64 {
+        (mem::size_of::<PackedInternedString>() as u64) * (string_table_len as u64)
+    }
+
+    /// Returns the subslice of string table entries from the `data` blob.
+    /// The caller guarantees `lookup_len`, `path_components_len` and `string_table_len` are valid for the `data` blob.
+    unsafe fn string_table(
+        data: &[u8],
+        lookup_len: PathComponentIndex,
+        path_components_len: PathComponentIndex,
+        extension_table_len: ExtensionIndex,
+        string_table_len: StringIndex,
+    ) -> &[PackedInternedString] {
+        Self::slice(
+            data,
+            Self::string_table_offset(lookup_len, path_components_len, extension_table_len),
+            string_table_len as _,
+        )
     }
 
     /// Minimum size of the (variable length) string section given the string table length. Assumes 1-byte strings.
-    const fn min_string_section_size(string_table_len: StringIndex) -> usize {
-        1 * string_table_len as usize
+    const fn min_string_section_size(string_table_len: StringIndex) -> u64 {
+        1 * string_table_len as u64
     }
 
     /// Minimum size of the valid file tree data blob.
-    /// Header, 1 lookup entry, 1 path component entry, 1 string table entry, 1-byte string.
-    fn min_size() -> usize {
-        Self::required_size(1, 1, 1)
+    /// Header, 1 lookup entry, 1 path component entry, 0 extension entries, 1 string table entry, 1-byte string.
+    fn min_size() -> u64 {
+        Self::required_size(1, 1, 0, 1)
     }
 
     /// Calculates the required minimum data blob size in bytes for given section lengths from the header.
     fn required_size(
         lookup_len: PathComponentIndex,
         path_components_len: PathComponentIndex,
+        extension_table_len: ExtensionIndex,
         string_table_len: StringIndex,
-    ) -> usize {
-        Self::string_section_start(lookup_len, path_components_len, string_table_len)
-            + Self::min_string_section_size(string_table_len)
+    ) -> u64 {
+        Self::string_section_start(
+            lookup_len,
+            path_components_len,
+            extension_table_len,
+            string_table_len,
+        ) + Self::min_string_section_size(string_table_len)
     }
 
     /// Calculates the offset in bytes to the (variable length) string section for given section lengths from the header.
     fn string_section_start(
         lookup_len: PathComponentIndex,
         path_components_len: PathComponentIndex,
+        extension_table_len: ExtensionIndex,
         string_table_len: StringIndex,
-    ) -> usize {
-        mem::size_of::<FileTreeHeader>()
-            + Self::lookup_keys_size(lookup_len)
-            + Self::lookup_values_size(lookup_len)
-            + Self::path_component_table_size(path_components_len)
+    ) -> StringOffset {
+        (mem::size_of::<FileTreeHeader>() as StringOffset)
+            + Self::path_hashes_size(lookup_len)
+            + Self::leaf_path_components_size(lookup_len)
+            + Self::path_components_size(path_components_len)
+            + Self::extension_table_size(extension_table_len)
             + Self::string_table_size(string_table_len)
     }
 
@@ -594,87 +770,9 @@ impl<'a> FileTreeReader<'a> {
         }
     */
 
-    /// The caller guarantees the `data` is at least large enough to hold a `FileTreeHeader`.
-    unsafe fn header(data: &[u8]) -> &FileTreeHeader {
-        &*(data.as_ptr() as *const _)
-    }
-
-    /// Calculates the offset in bytes from the start of the file tree data blob to the array of lookup keys.
-    const fn lookup_keys_offset() -> u64 {
-        mem::size_of::<FileTreeHeader>() as _
-    }
-
-    /// Returns the subslice of lookup keys (path hashes) from the `data` blob.
-    /// The caller guarantees `lookup_len` is valid for the `data` blob.
-    unsafe fn lookup_keys<'d>(data: &'d [u8], lookup_len: PathComponentIndex) -> &'d [PathHash] {
-        Self::slice(data, Self::lookup_keys_offset(), lookup_len as _)
-    }
-
-    /// Calculates the offset in bytes from the start of the file tree data blob to the array of lookup values.
-    const fn lookup_values_offset(lookup_len: PathComponentIndex) -> u64 {
-        Self::lookup_keys_offset() + (lookup_len as u64) * (mem::size_of::<PathHash>() as u64)
-    }
-
-    /// Returns the subslice of lookup values (leaf path components) from the `data` blob.
-    /// The caller guarantees `lookup_len` is valid for the `data` blob.
-    unsafe fn lookup_values<'d>(
-        data: &'d [u8],
-        lookup_len: PathComponentIndex,
-    ) -> &'d [PackedLeafPathComponent] {
-        Self::slice(
-            data,
-            Self::lookup_values_offset(lookup_len),
-            lookup_len as _,
-        )
-    }
-
-    /// Calculates the offset in bytes from the start of the file tree data blob to the array of path components.
-    const fn path_components_offset(lookup_len: PathComponentIndex) -> u64 {
-        Self::lookup_values_offset(lookup_len)
-            + (lookup_len as u64) * (mem::size_of::<PackedLeafPathComponent>() as u64)
-    }
-
-    /// Returns the subslice of path components from the `data` blob.
-    /// The caller guarantees `lookup_len` and `path_components_len` are valid for the `data` blob.
-    unsafe fn path_components(
-        data: &[u8],
-        lookup_len: PathComponentIndex,
-        path_components_len: PathComponentIndex,
-    ) -> &[PackedPathComponent] {
-        Self::slice(
-            data,
-            Self::path_components_offset(lookup_len),
-            path_components_len as _,
-        )
-    }
-
-    /// Calculates the offset in bytes from the start of the file tree data blob to the string table.
-    const fn string_table_offset(
-        lookup_len: PathComponentIndex,
-        path_components_len: PathComponentIndex,
-    ) -> u64 {
-        Self::path_components_offset(lookup_len)
-            + (path_components_len as u64) * (mem::size_of::<PackedPathComponent>() as u64)
-    }
-
-    /// Returns the subslice of string table entries from the `data` blob.
-    /// The caller guarantees `lookup_len`, `path_components_len` and `string_table_len` are valid for the `data` blob.
-    unsafe fn string_table(
-        data: &[u8],
-        lookup_len: PathComponentIndex,
-        path_components_len: PathComponentIndex,
-        string_table_len: StringIndex,
-    ) -> &[PackedInternedString] {
-        Self::slice(
-            data,
-            Self::string_table_offset(lookup_len, path_components_len),
-            string_table_len as _,
-        )
-    }
-
     /// Returns a UTF-8 string slice within the `data` blob at `offset` (in bytes) from the start, with `len` bytes.
     /// The caller guarantees `offset` and `len` are valid, and that the data at those is a valid UTF-8 string.
-    /// NOTE: file stems may be empty, with zero both `offset` and `len`.
+    /// NOTE: file stems may be empty, with both `offset` and `len` being zero.
     unsafe fn string_slice(data: &[u8], offset: StringOffset, len: ComponentStringLength) -> &str {
         debug_assert!(len > 0 || offset == 0);
         str::from_utf8_unchecked(Self::slice(data, offset, len as _))
@@ -689,50 +787,33 @@ impl<'a> FileTreeReader<'a> {
     }
 }
 
-/// (Reverse, leaf-to-root) iterator over the file path components starting at `cur_component`.
-struct PathIter<'a, 'b> {
+/// (Reverse) iterator over the (folder) file path components starting at `path_component`.
+struct FolderIter<'a, 'b> {
     reader: &'a FileTreeReader<'b>,
-    cur_component: Option<PathComponent>,
-    num_components: NumComponents,
+    path_component: Option<PathComponent>,
 }
 
-impl<'a, 'b> PathIter<'a, 'b> {
-    fn new(
-        reader: &'a FileTreeReader<'b>,
-        cur_component: Option<PathComponent>,
-        num_components: NumComponents,
-    ) -> Self {
-        debug_assert!(cur_component.is_some() || num_components == 0);
-
+impl<'a, 'b> FolderIter<'a, 'b> {
+    fn new(reader: &'a FileTreeReader<'b>, path_component: Option<PathComponent>) -> Self {
         Self {
             reader,
-            cur_component,
-            num_components,
+            path_component,
         }
     }
 }
 
-impl<'a, 'b> Iterator for PathIter<'a, 'b> {
+impl<'a, 'b> Iterator for FolderIter<'a, 'b> {
     type Item = &'a NonEmptyStr;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.cur_component.take().map(|cur_component| {
-            if let Some(parent_index) = cur_component.parent_index {
-                self.cur_component
-                    .replace(self.reader.path_component(parent_index));
+        self.path_component.take().map(|path_component| {
+            if let Some(parent) = path_component.parent {
+                self.path_component
+                    .replace(self.reader.path_component(parent));
             }
-
-            debug_assert!(self.num_components > 0);
-            self.num_components -= 1;
-
-            self.reader.non_empty_string(cur_component.string_index)
+            // Folder names may not be empty.
+            self.reader.non_empty_string(path_component.string)
         })
-    }
-}
-
-impl<'a, 'b> ExactSizeIterator for PathIter<'a, 'b> {
-    fn len(&self) -> usize {
-        self.num_components as _
     }
 }
 
@@ -763,9 +844,12 @@ mod tests {
         let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
 
         let paths = &[
-            filepath!("foo/bar/baz.cfg"),
-            filepath!("foo/bar/.cfg"),
             filepath!("foo/bar/baz"),
+            filepath!("foo/bar/baz.cfg"),
+            filepath!("foo/bar/baz.txt"),
+            filepath!("foo/bar/.cfg"),
+            filepath!("foo/bar/bill.txt"),
+            filepath!("foo/bar/bob.cfg"),
             filepath!("fOO/bar/bill.txt"),
             filepath!("fOO/bar/bob.cfg"),
             filepath!("foo/bAr/bar"),
@@ -781,7 +865,6 @@ mod tests {
             .collect::<Vec<_>>();
 
         let len = writer.len();
-        let num_strings = writer.num_strings();
         let string_len = writer.string_len();
 
         let data = writer.write_to_vec(version).unwrap().into_boxed_slice();
@@ -799,7 +882,6 @@ mod tests {
 
             assert_eq!(reader.version(), version);
             assert_eq!(reader.len(), len);
-            assert_eq!(reader.num_strings(), num_strings);
             assert_eq!(reader.string_len(), string_len);
 
             let mut builder = FilePathBuilder::new();

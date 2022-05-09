@@ -2,4 +2,5 @@
 .hg/
 .vscode/
 target/
+target2/
 Cargo.lock

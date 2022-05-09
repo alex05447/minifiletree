@@ -14,9 +14,11 @@ big_endian = []
 
 [dependencies]
 static_assertions = "1.1.*"
+bitflags = "1.3.*"
 ministr = { path = "../ministr" }
 minifilepath = { path = "../minifilepath" }
 
 [dev-dependencies]
 seahash = { version = "4.1" }
 minifilepath_macro = { path = "../minifilepath_macro" }
+ministr_macro = { path = "../ministr_macro" }

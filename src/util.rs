@@ -56,6 +56,22 @@ pub(crate) fn u64_from_bin(bin: u64) -> u64 {
     }
 }
 
+fn write_all<W: Write>(w: &mut W, buf: &[u8]) -> Result<usize, std::io::Error> {
+    w.write_all(buf).map(|_| buf.len())
+}
+
+pub(crate) fn write_u64<W: Write>(w: &mut W, val: u64) -> Result<usize, std::io::Error> {
+    write_all(w, &u64_to_bin_bytes(val))
+}
+
+pub(crate) fn write_u32<W: Write>(w: &mut W, val: u32) -> Result<usize, std::io::Error> {
+    write_all(w, &u32_to_bin_bytes(val))
+}
+
+pub(crate) fn write_u16<W: Write>(w: &mut W, val: u16) -> Result<usize, std::io::Error> {
+    write_all(w, &u16_to_bin_bytes(val))
+}
+
 /// One or multiple values in the multimap associated with a given key.
 enum OneOrMultiple<T> {
     /// Usual case - one value associated with a key.
@@ -103,8 +119,23 @@ impl<K: Eq + Hash, V: Eq + Copy> MultiMap<K, V> {
         })
     }
 
+    pub(crate) fn get_mut(&mut self, key: &K) -> Option<&mut [V]> {
+        self.0.get_mut(&key).map(|entry| match entry {
+            OneOrMultiple::One(value) => slice::from_mut(value),
+            OneOrMultiple::Multiple(values) => values,
+        })
+    }
+
     pub(crate) fn clear(&mut self) {
         self.0.clear()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn iter(&self) -> impl std::iter::Iterator<Item = &[V]> {
+        self.0.iter().map(|(_, v)| match v {
+            OneOrMultiple::One(value) => slice::from_ref(value),
+            OneOrMultiple::Multiple(values) => values,
+        })
     }
 }
 
@@ -172,7 +203,7 @@ pub(crate) fn build_path_string<'i, I>(
     debug_assert_eq!(offset, 0);
 }
 
-fn debug_unreachable() -> ! {
+pub(crate) fn debug_unreachable() -> ! {
     if cfg!(debug_assertions) {
         unreachable!()
     } else {
@@ -186,20 +217,4 @@ pub(crate) unsafe fn debug_unwrap<T>(val: Option<T>) -> T {
     } else {
         debug_unreachable()
     }
-}
-
-fn write_all<W: Write>(w: &mut W, buf: &[u8]) -> Result<usize, std::io::Error> {
-    w.write_all(buf).map(|_| buf.len())
-}
-
-pub(crate) fn write_u64<W: Write>(w: &mut W, val: u64) -> Result<usize, std::io::Error> {
-    write_all(w, &u64_to_bin_bytes(val))
-}
-
-pub(crate) fn write_u32<W: Write>(w: &mut W, val: u32) -> Result<usize, std::io::Error> {
-    write_all(w, &u32_to_bin_bytes(val))
-}
-
-pub(crate) fn write_u16<W: Write>(w: &mut W, val: u16) -> Result<usize, std::io::Error> {
-    write_all(w, &u16_to_bin_bytes(val))
 }

@@ -1,53 +1,61 @@
+#![allow(non_upper_case_globals)]
+
 use {
     crate::*,
+    bitflags::*,
     minifilepath::*,
     ministr::*,
     std::{
         collections::HashMap,
         hash::{BuildHasher, Hash, Hasher},
         io::{self, Write},
-        iter::Iterator,
+        iter::{self, Iterator},
         mem::size_of,
     },
 };
 
-type PathComponents = Vec<PathComponent>;
-
-/// Here the `PathHash` key is the hash of the entire path.
+/// Used to keep track of inserted file names.
+/// Here the `PathHash` key is the full hash of the entire file path.
+///
+/// The hash is obtained by hashing path components (treating the file name as having no extension).
+/// E.g. the path "foo/bar.txt" is hashed as a sequence of strings `[ "foo", "bar.txt" ]`.
+/// NOTE - this is different from the subpath hash used in `SubpathLookup`, which would be hashed as `[ "foo", "bar", "txt" ]`.
+///
 /// `HashMap` and not a `MultiMap` because we don't allow hash collisions for leaf file paths.
 /// NOTE: need to store the full `LeafPathComponent` in the leaf lookup, because even though we are guaranteed
 /// to never have hash collisions between leaf paths (as we don't allow them), we might have hash collisions
 /// between leaf paths and subpaths, so can't rely on `SubpathLookup` to only contain only one entry for the leaf path hash.
 type PathLookup = HashMap<PathHash, LeafPathComponent>;
 
+/// Used for optimal subpath reuse / deduplication and handling file / folder name collision errors.
 /// Here the `PathHash` key is the accumulated hash of the entire subpath so far.
+///
+/// The subpath hash is obtained by hashing folder names and file names / file stems and extensions.
+/// E.g. the path "foo/bar.txt" is hashed as a sequence of strings `[ "foo", "bar", "txt" ]`.
+/// NOTE - this is different from the full file path hash used in `PathLookup`, which would be hashed as `[ "foo", "bar.txt" ]`.
 type SubpathLookup = MultiMap<PathHash, SubpathComponent>;
 
-/// Here the `PathHash` key is the hash of just a single path component.
+/// Used for optimal path component (folder name, file name, file stem, extension) string reuse / deduplication.
+/// Here the `PathHash` key is the hash of just a single path component string.
 type StringLookup = MultiMap<PathHash, StringIndex>;
 
+/// Array of all unique path components added so far for folder / file name / file stem subpaths (but not for extensions).
+/// Index into by `PathLookup` and `SubpathLookup` entries.
+type PathComponents = Vec<PathComponent>;
+
+/// Array of all unique strings added so far.
+/// Indexed into by `PathComponents` entries.
+/// Used to index into the `String`.
 type StringTable = Vec<InternedString>;
 
-/// Need to disambiguate between subpath components for extensions / file stems
-/// (to correctly handle `FolderAlreadyExistsAtFilePath` / `FileAlreadyExistsAtFolderPath` errors,
-/// but still allow file stem subpaths to be reused)
-/// and everything else.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SubpathComponentType {
-    Extension,
-    FileStem,
-    FileOrFolderName,
-}
+/// Used for optimal extension string reuse / deduplication.
+/// Here the `PathHash` key is the hash of just a single extension string.
+type ExtensionLookup = MultiMap<PathHash, ExtensionIndex>;
 
-/// Like `LeafPathComponent`, but
-/// 1) doesn't need `num_components`, and
-/// 2) needs more precise `component_type` instead of just an `is_extension` flag.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct SubpathComponent {
-    path_component_index: PathComponentIndex,
-    string_len: FullStringLength,
-    component_type: SubpathComponentType,
-}
+/// Array of all unique extensions added so far.
+/// Indexed into by `ExtensionLookup` entries.
+/// Used to index into the `StringTable`.
+type ExtensionTable = Vec<StringIndex>;
 
 /// Provides an API to append [`hashed`](PathHash) [`file paths`](FilePath) to a lookup data structure and store them space-efficiently.
 /// Deduplicates unique [`path component`](FilePathComponent) strings (including extensions) and file tree nodes.
@@ -59,20 +67,31 @@ struct SubpathComponent {
 pub struct FileTreeWriter<H: BuildHasher> {
     /// User-provided hasher builder used to build the hasher which is used to hash the paths.
     hash_builder: H,
-    /// Persistent array of valid path components added so far.
-    /// Indexed into by entries of `subpath_lookup` and `path_lookup`.
-    ///
-    /// Needed by the writer and serialized to the data blob.
-    path_components: PathComponents,
     /// Persistent lookup map from a full file path hash to its leaf path component.
+    /// See `PathLookup`.
     ///
     /// Needed by the writer and serialized to the data blob.
     path_lookup: PathLookup,
     /// Temporary lookup map from each valid subpath hash added so far to its index
     /// (or indices, if there's subpath string hash collisions) in the `path_components` array.
+    /// See `SubpathLookup`.
     ///
     /// Needed only by the writer, not serialized to the data blob.
     subpath_lookup: SubpathLookup,
+    /// Persistent array of valid path components added so far.
+    /// Indexed into by entries of `subpath_lookup` and `path_lookup`.
+    ///
+    /// Needed by the writer and serialized to the data blob.
+    path_components: PathComponents,
+    /// Temporary lookup map from a single extension string's hash to its index
+    /// (or indices, if there's subpath string hash collisions) in the `extension_table`.
+    ///
+    /// Needed only by the writer, not serialized to the data blob.
+    extension_lookup: ExtensionLookup,
+    /// Persistent array of unique extension string indices in the `string_table`.
+    ///
+    /// Needed by the writer and serialized to the data blob.
+    extension_table: ExtensionTable,
     /// Temporary lookup map from a single path component string's hash to its index
     /// (or indices, if there's subpath string hash collisions) in the `string_table`.
     ///
@@ -90,7 +109,13 @@ pub struct FileTreeWriter<H: BuildHasher> {
     strings: String,
 }
 
-impl<H: BuildHasher> FileTreeWriter<H> {
+impl<H> FileTreeWriter<H>
+where
+    H: BuildHasher,
+    // TODO: `Clone` requirement might be relaxed, but it would require hashing path strings in parallel more than once,
+    // bit I assume cloning any reasonable hasher is very cheap.
+    H::Hasher: Clone,
+{
     /// Create a new [`file tree writer`] with the provided [`hash_builder`].
     ///
     /// [`hash_builder`] is used to hash [`inserted`] paths and their subpaths / individual components.
@@ -101,9 +126,11 @@ impl<H: BuildHasher> FileTreeWriter<H> {
     pub fn new(hash_builder: H) -> Self {
         Self {
             hash_builder,
-            path_components: Vec::new(),
             path_lookup: PathLookup::new(),
             subpath_lookup: SubpathLookup::new(),
+            path_components: Vec::new(),
+            extension_lookup: MultiMap::new(),
+            extension_table: Vec::new(),
             string_lookup: StringLookup::new(),
             string_table: Vec::new(),
             strings: String::new(),
@@ -124,10 +151,10 @@ impl<H: BuildHasher> FileTreeWriter<H> {
 
         let path = path.as_ref();
 
-        // Count the number of components, and hash the path fully to determine straight up if we have a path hash collision
+        // Count the number of components (needed to process the extension, if any, separately in the main loop below),
+        // and hash the path fully to determine straight up if we have a path hash collision
         // (or the same path is being inserted more then once).
         // Need to preprocess to avoid inserting strings / subpaths into the lookup if the path is ultimately found to be invalid.
-        // NOTE: file extension, if any, will be treated as an additional component later.
         let (num_components, path_hash) = {
             let mut hasher = self.hash_builder.build_hasher();
             let mut num_components: NumComponents = 0;
@@ -146,114 +173,378 @@ impl<H: BuildHasher> FileTreeWriter<H> {
                 let mut _hasher = self.hash_builder.build_hasher();
                 path.hash(&mut _hasher);
                 let _path_hash = _hasher.finish();
-                debug_assert_eq!(path_hash, _path_hash);
+                debug_assert_eq!(
+                    path_hash, _path_hash,
+                    "path hashing assumes paths are hashed component-wise"
+                );
             }
 
             (num_components, path_hash)
         };
 
-        // Check for already added paths and file path hash collisions.
+        // Check for full file path hash collisions (or the same path added more than once).
         if let Some(&lpc) = self.path_lookup.get(&path_hash) {
             if self
-                .iter(lpc.path_component_index, lpc.is_extension)
-                .eq(file_path_iter(path))
+                .iter(lpc.path_component, lpc.extension)
+                .eq(file_path_rev_iter(path))
             {
                 return Err(FileTreeWriterError::PathAlreadyExists);
             } else {
                 return Err(FileTreeWriterError::PathHashCollision(self.path_buf(
-                    lpc.path_component_index,
+                    lpc.path_component,
+                    lpc.extension,
                     lpc.string_len,
-                    lpc.is_extension,
+                    //lpc.is_extension,
                 )));
             }
         }
 
-        let mut hasher = self.hash_builder.build_hasher();
-        // Separate hasher needed to hash file name stems without the extension (if any) to reuse certain subpaths
-        // (e.g. reuse "foo/bar" when "foo/bar.txt" already exists).
-        let mut file_stem_hasher = self.hash_builder.build_hasher();
+        // Explicitly handle file names with extensions which match folder names of the same form.
+        //
+        // E.g. we want to error out when inserting "foo/bar.txt/baz" (folder name "bar.txt"),
+        // then "foo/bar.txt" (file name "bar.txt").
+        // Otherwise, code below will not match folder name "foo" followed by file stem "bar"
+        // and will insert a new component and continue instead of returning an error.
+        //
+        // To do this, we hash the path as if its file name with extension was a folder name.
+        //
+        // Also see `folder_name_as_file_stem_and_extension_rev_iter()`.
+        let mut subpath_hasher = self.hash_builder.build_hasher();
+
+        for path_component_or_extension in path_component_and_extension_iter(path, num_components) {
+            match path_component_or_extension {
+                PathComponentKind::Folder(folder_name) => {
+                    subpath_hasher.write(folder_name.as_bytes());
+                }
+                PathComponentKind::FileStem(file_stem) => {
+                    subpath_hasher.write(file_stem_str(&file_stem).as_bytes());
+                }
+                PathComponentKind::Extension(extension) => {
+                    // Re-hash the file name with an extension as a folder name
+                    // (i.e., do `hash("foo", "bar.txt")` for path "foo/bar.txt" instead of the normal `hash("foo", "bar", "txt")`).
+                    subpath_hasher.write(".".as_bytes());
+                    subpath_hasher.write(extension.as_bytes());
+                    let subpath_hash = subpath_hasher.finish();
+
+                    if let Some(folder_spcs) = self
+                        .subpath_lookup
+                        .get(&subpath_hash)
+                        .map(|spcs| spcs.iter().filter(|spc| spc.is_folder_name()))
+                    {
+                        for folder_spc in folder_spcs {
+                            if self
+                                .folder_name_as_file_stem_and_extension_rev_iter(
+                                    folder_spc.path_component_or_file_stem_index,
+                                )
+                                .eq(file_path_rev_iter(path))
+                            {
+                                return Err(FolderAlreadyExistsAtFilePath);
+                            }
+                        }
+                    }
+                }
+                // File names with no extension have no such issue.
+                PathComponentKind::FileName(_) => {}
+            }
+        }
+
+        // See `SubpathHash`.
+        let mut subpath_hasher = self.hash_builder.build_hasher();
+        // This is used to hash folder names which alias file names with extensions.
+        // See `find_file_name_with_extension_for_folder_name()` below.
+        let mut folder_name_hasher = self.hash_builder.build_hasher();
 
         // Index of the parent path component for each processed path component in the loop below;
         // index of the leaf/file path component after the last one was processed.
         let mut parent_index = None;
+        // If the file name has an extension, this will be its index in the extension table.
+        let mut extension_index = None;
+        // Full file path string length, separators included.
         let mut string_len: FullStringLength = 0;
 
-        let mut has_extension = false;
+        for path_component in path_component_and_extension_iter(path, num_components) {
+            let path_component_str = path_component.as_str();
 
-        for (path_component_idx, path_component) in path.components().enumerate() {
-            // If it's the last path component, it must be the name of a file
-            // (and thus no other file/folder is allowed to exist at that path).
-            let last = path_component_idx == (num_components - 1) as _;
+            string_len += path_component_str.len() as FullStringLength;
 
-            string_len += path_component.len() as FullStringLength;
-
-            // Hash the subpath so far.
-            hasher.write(path_component.as_bytes());
-            let subpath_hash = hasher.finish();
+            // Hash the subpath string so far.
+            debug_assert_eq!(subpath_hasher.finish(), folder_name_hasher.finish());
+            subpath_hasher.write(path_component_str.as_bytes());
+            let subpath_hash = subpath_hasher.finish();
 
             // Check if the path component / file tree node for this subpath already exists
-            // (including file stems reused for new folder names).
-            let (path_component_index, _has_extension) = if let Some(spc) =
-                self.find_existing_subpath(subpath_hash, path_component, parent_index, last)
-            {
-                // Make sure that
-                // 1) we're not processing the leaf/file component
-                // (because we can't have a new file with the same name as an existing folder
-                // (NOTE: can't be an existing file, because we'd error out above on a full path hash check))
-                // (unless we reused a file stem component, which is OK (e.g. we had "foo/bar.txt" and inserted "foo/bar"));
-                // ...
-                if last {
-                    if spc.component_type != SubpathComponentType::FileStem {
-                        debug_assert!(!self.path_lookup.contains_key(&subpath_hash));
-                        return Err(FolderAlreadyExistsAtFilePath);
-                    }
-                }
-                // ...
-                // 2) the subpath is not a path to an existing file
-                // (because we can't have a new folder with the same name as an existing file);
-                else if self.path_lookup.contains_key(&subpath_hash) {
-                    //return Err(FileAlreadyExistsAtFolderPath(self.path_buf(spc).into()));
-                    return Err(FileAlreadyExistsAtFolderPath(
-                        self.path_buf(
-                            spc.path_component_index,
-                            spc.string_len,
-                            spc.component_type == SubpathComponentType::Extension,
-                        )
-                        .into(),
-                    ));
-                }
+            let subpath = Self::reuse_subpath(
+                &mut self.subpath_lookup,
+                &self.path_components,
+                &self.extension_table,
+                &self.string_table,
+                &self.strings,
+                subpath_hash,
+                path_component.as_str(),
+                parent_index,
+            );
 
-                // Update the file stem hasher with the full path component string to get it up to date with the subpath hasher.
-                file_stem_hasher.write(path_component.as_bytes());
-                debug_assert_eq!(hasher.finish(), file_stem_hasher.finish());
-
-                (spc.path_component_index, false)
-
-            // If this subpath doesn't exist yet, we're going to add it.
+            let subpath = if let Some(subpath) = subpath {
+                Some(subpath)
             } else {
-                self.add_path_component(
-                    subpath_hash,
+                // Explicitly handle folder names which match file names with extensions of the same form.
+                //
+                // E.g. we want to error out when first inserting "foo/bar.txt" (file name with extension "bar.txt"),
+                // then "foo/bar.txt/baz" (folder name "bar.txt").
+                // Otherwise, code above will match folder name "foo", but not folder name "bar.txt",
+                // and we will insert a new component (file stem "bar") and continue instead of returning an error.
+                //
+                // "foo/bar.txt/..." -> "foo/bar.txt/..." => "bar.txt" is a folder name, would be reused above
+                // "foo/bar/txt" -> "foo/bar.txt/baz" => "txt" is a file name, no reuse happens.
+                // "foo/bar/txt.cfg" -> "foo/bar.txt/baz" => "txt" is a file stem, no reuse happens.
+                // "foo/bar.txt" -> "foo/bar.txt/baz" => "txt" is an extension, error.
+                //
+                // Also see `find_file_name_with_extension_for_folder_name()`.
+                if let Some(subpath) = self.find_file_name_with_extension_for_folder_name(
+                    folder_name_hasher.clone(),
                     path_component,
                     parent_index,
-                    last,
-                    string_len,
-                    &mut file_stem_hasher,
-                )
+                ) {
+                    debug_assert!(subpath.is_extension());
+
+                    return Err(FileAlreadyExistsAtFolderPath(self.path_buf(
+                        subpath.path_component_or_file_stem_index,
+                        subpath.extension_index,
+                        subpath.string_len,
+                    )));
+                }
+
+                None
+            };
+
+            // Reset the folder name hasher to the current subpath hash.
+            folder_name_hasher = subpath_hasher.clone();
+
+            let subpath_index = if let Some(subpath) = subpath {
+                match path_component {
+                    PathComponentKind::FileName(_) => {
+                        // Reused the (folder name, file stem or extension) subpath as the file name.
+
+                        // Check if we reused a folder name as the file name, which is an error.
+                        // E.g. reusing folder name "bar" in "foo/bar/baz.txt" as a file name in "foo/bar".
+                        if subpath.is_folder_name() {
+                            // Can use `subpath_hash` in `path_lookup` because the path has no extension.
+                            debug_assert!(!self.path_lookup.contains_key(&subpath_hash));
+                            return Err(FolderAlreadyExistsAtFilePath);
+                        }
+
+                        // Reused the (file stem or extension) subpath as the file name.
+                        subpath.reuse_as_file_name();
+
+                        // Reused an extension with no path component as the file name - need to add a path component for the extension
+                        // and modify the subpath to use the new path component instead.
+                        // Leaf path component for the subpath will still use the extension index.
+                        if subpath.is_extension() {
+                            // Extension subpath with an extension index - `path_component_or_file_stem_index` points to the file stem path component.
+                            // Need to create an extension path component.
+                            if subpath.extension_index.take().is_some() {
+                                let extension_index = Self::add_component(
+                                    &mut self.path_components,
+                                    &mut self.string_lookup,
+                                    &mut self.string_table,
+                                    &mut self.strings,
+                                    self.hash_builder.build_hasher(),
+                                    path_component,
+                                    parent_index,
+                                );
+
+                                subpath.path_component_or_file_stem_index = extension_index;
+
+                                extension_index
+                            } else {
+                                // Extension subpath with no extension index - `path_component_or_file_stem_index` points to the extension path component.
+                                subpath.path_component_or_file_stem_index
+                            }
+                        } else {
+                            // Reused the file stem subpath as file name.
+                            subpath.path_component_or_file_stem_index
+                        }
+                    }
+                    PathComponentKind::Folder(_) => {
+                        // Reused the (any) subpath as folder name.
+
+                        // Check if we reused a file name as a folder name, which is an error.
+                        // E.g. reusing file name "bar" in "foo/bar" as a folder name in "foo/bar/baz.txt".
+                        if subpath.is_file_name() {
+                            let index = subpath.path_component_or_file_stem_index;
+                            let extension_index = subpath.extension_index;
+                            let string_len = subpath.string_len;
+
+                            return Err(FileAlreadyExistsAtFolderPath(self.path_buf(
+                                index,
+                                extension_index,
+                                string_len,
+                            )));
+                        }
+
+                        // Reused the (folder name, file stem or extension) subpath as folder name.
+                        subpath.reuse_as_folder_name();
+
+                        // Reused an extension with no path component as the folder name - need to add a path component for the extension
+                        // and modify the subpath to use the new path component instead.
+                        if subpath.is_extension() {
+                            if subpath.extension_index.take().is_some() {
+                                // Extension subpath with an extension index - `path_component_or_file_stem_index` points to the file stem path component.
+                                // Need to create an extension path component.
+                                let extension_index = Self::add_component(
+                                    &mut self.path_components,
+                                    &mut self.string_lookup,
+                                    &mut self.string_table,
+                                    &mut self.strings,
+                                    self.hash_builder.build_hasher(),
+                                    path_component,
+                                    parent_index,
+                                );
+
+                                subpath.path_component_or_file_stem_index = extension_index;
+
+                                extension_index
+                            } else {
+                                // Extension subpath with no extension index - `path_component_or_file_stem_index` points to the extension path component.
+                                subpath.path_component_or_file_stem_index
+                            }
+                        } else {
+                            // Reused the folder name or file stem subpath as folder name.
+                            subpath.path_component_or_file_stem_index
+                        }
+                    }
+                    PathComponentKind::FileStem(_) => {
+                        // Reused (any) subpath as file stem.
+                        subpath.reuse_as_file_stem();
+
+                        // Reused an extension with no path component as the file stem - need to add a path component for the extension
+                        // and modify the subpath to use the new path component instead.
+                        if subpath.is_extension() {
+                            if subpath.extension_index.take().is_some() {
+                                // Extension subpath with an extension index - `path_component_or_file_stem_index` points to the file stem path component.
+                                // Need to create an extension path component.
+                                let extension_index = Self::add_component(
+                                    &mut self.path_components,
+                                    &mut self.string_lookup,
+                                    &mut self.string_table,
+                                    &mut self.strings,
+                                    self.hash_builder.build_hasher(),
+                                    path_component,
+                                    parent_index,
+                                );
+
+                                subpath.path_component_or_file_stem_index = extension_index;
+
+                                extension_index
+                            } else {
+                                // Extension subpath with no extension index - `path_component_or_file_stem_index` points to the extension path component.
+                                subpath.path_component_or_file_stem_index
+                            }
+                        // Reused the (file name, folder name or file stem) subpath as folder name.
+                        } else {
+                            subpath.path_component_or_file_stem_index
+                        }
+                    }
+                    PathComponentKind::Extension(extension) => {
+                        // Reused a (folder name, file name or file stem) subpath as extension.
+                        subpath.reuse_as_extension();
+
+                        // Reuse an existing extension, or add a new one.
+                        // Always add a new extension and make the leaf path component use it, even if we could use the reused path component for this purpose.
+                        // This reuse is rare, and always requiring leaf path components for file names with extensions
+                        // to have an extension index makes them more compact and simplifies the logic.
+                        let extension_index_ = Self::extension_index(
+                            &mut self.string_lookup,
+                            &mut self.string_table,
+                            &mut self.strings,
+                            &mut self.extension_lookup,
+                            &mut self.extension_table,
+                            extension,
+                            &self.hash_builder,
+                        );
+
+                        extension_index.replace(extension_index_);
+
+                        // Must succeed - extension path components must have a file stem parent path component.
+                        unsafe { debug_unwrap(parent_index) }
+                    }
+                }
+            // We have not reused the current subpath.
+            } else {
+                // We are processing an extension - try to reuse an existing extension, or add a new one.
+                if let PathComponentKind::Extension(extension) = path_component {
+                    let extension_index_ = Self::extension_index(
+                        &mut self.string_lookup,
+                        &mut self.string_table,
+                        &mut self.strings,
+                        &mut self.extension_lookup,
+                        &mut self.extension_table,
+                        extension,
+                        &self.hash_builder,
+                    );
+
+                    extension_index.replace(extension_index_);
+
+                    // Must succeed - extension path components must have a file stem parent path component.
+                    let file_stem_index = unsafe { debug_unwrap(parent_index) };
+
+                    self.subpath_lookup.insert(
+                        subpath_hash,
+                        SubpathComponent::new_extension(
+                            file_stem_index,
+                            extension_index_,
+                            string_len,
+                        ),
+                    );
+
+                    file_stem_index
+
+                // We are processing a folder name, file name or file stem component - add a new path component for it.
+                } else {
+                    let path_component_index = Self::add_component(
+                        &mut self.path_components,
+                        &mut self.string_lookup,
+                        &mut self.string_table,
+                        &mut self.strings,
+                        self.hash_builder.build_hasher(),
+                        path_component,
+                        parent_index,
+                    );
+
+                    self.subpath_lookup.insert(
+                        subpath_hash,
+                        match path_component {
+                            PathComponentKind::Folder(_) => {
+                                SubpathComponent::new_folder(path_component_index, string_len)
+                            }
+                            PathComponentKind::FileName(_) => {
+                                SubpathComponent::new_file_name(path_component_index, string_len)
+                            }
+                            PathComponentKind::FileStem(_) => {
+                                SubpathComponent::new_file_stem(path_component_index, string_len)
+                            }
+                            PathComponentKind::Extension(_) => {
+                                // Extensions are handled above.
+                                debug_unreachable()
+                            }
+                        },
+                    );
+
+                    path_component_index
+                }
             };
 
             // Update the parent index to the current path component index.
-            parent_index.replace(path_component_index);
+            parent_index.replace(subpath_index);
 
             // Account for the path component separator in the total string length.
-            if !last {
+            if !matches!(
+                path_component,
+                PathComponentKind::Extension(_) | PathComponentKind::FileName(_)
+            ) {
                 string_len += 1;
-            } else {
-                has_extension = _has_extension;
             }
         }
-
-        debug_assert_eq!(path_hash, hasher.finish());
-        debug_assert_eq!(path_hash, file_stem_hasher.finish());
 
         // Update the leaf path components.
 
@@ -262,17 +553,7 @@ impl<H: BuildHasher> FileTreeWriter<H> {
 
         let _none = self.path_lookup.insert(
             path_hash,
-            LeafPathComponent::new(
-                parent_index,
-                // Account for the extra path component for the extension.
-                if has_extension {
-                    num_components + 1
-                } else {
-                    num_components
-                },
-                string_len,
-                has_extension,
-            ),
+            LeafPathComponent::new(parent_index, extension_index, string_len),
         );
         // Must be `None`, or we'd error out above.
         debug_assert!(_none.is_none());
@@ -291,6 +572,7 @@ impl<H: BuildHasher> FileTreeWriter<H> {
             self.path_lookup.len() as _,
             self.path_components.len() as _,
             self.string_table.len() as _,
+            self.extension_table.len() as _,
             version,
         );
 
@@ -326,6 +608,21 @@ impl<H: BuildHasher> FileTreeWriter<H> {
 
         for path_component in self.path_components {
             written += path_component.write(w)?;
+        }
+
+        debug_assert!(written % 8 == 0, "should be aligned to 8 bytes");
+
+        // Extension table.
+
+        for extension in self.extension_table {
+            written += write_u32(w, extension)?;
+        }
+
+        // Align to 8 bytes.
+        let mut to_write = written % 8;
+        while to_write > 0 {
+            w.write_all(&[b'0'])?;
+            to_write -= 1;
         }
 
         debug_assert!(written % 8 == 0, "should be aligned to 8 bytes");
@@ -371,8 +668,23 @@ impl<H: BuildHasher> FileTreeWriter<H> {
     }
 
     /// Returns the total length in bytes of all unique strings [`inserted`](#method.insert) into the writer.
-    pub fn string_len(&self) -> usize {
-        self.strings.len()
+    pub fn string_len(&self) -> u64 {
+        self.strings.len() as u64
+    }
+
+    /// Returns the number of unique path components [`inserted`](#method.insert) into the writer.
+    pub fn num_components(&self) -> usize {
+        self.path_components.len()
+    }
+
+    /// Returns the number of unique extensions [`inserted`](#method.insert) into the writer.
+    pub fn num_extensions(&self) -> usize {
+        self.extension_table.len()
+    }
+
+    #[cfg(test)]
+    fn num_subpaths(&self) -> usize {
+        self.subpath_lookup.iter().fold(0, |num, v| num + v.len())
     }
 
     /// Clears the writer, resetting all internal data structures without deallocating any storage.
@@ -381,6 +693,8 @@ impl<H: BuildHasher> FileTreeWriter<H> {
         self.string_lookup.clear();
         self.path_lookup.clear();
         self.path_components.clear();
+        self.extension_lookup.clear();
+        self.extension_table.clear();
         self.string_table.clear();
         self.strings.clear();
     }
@@ -394,12 +708,7 @@ impl<H: BuildHasher> FileTreeWriter<H> {
         builder: FilePathBuilder,
     ) -> Result<FilePathBuf, FilePathBuilder> {
         if let Some(&lpc) = self.path_lookup.get(&hash) {
-            Ok(self.build_path_string(
-                lpc.path_component_index,
-                lpc.string_len,
-                lpc.is_extension,
-                builder,
-            ))
+            Ok(self.build_path_string(lpc.path_component, lpc.extension, lpc.string_len, builder))
         } else {
             Err(builder)
         }
@@ -410,283 +719,38 @@ impl<H: BuildHasher> FileTreeWriter<H> {
         self.lookup_into(hash, FilePathBuilder::new()).ok()
     }
 
-    /// Returns an existing subpath component, if any,
-    /// matching (the string of) the currently processed new subpath starting (in reverse) with `path_component`,
-    /// with `parent_index` parent (if any).
-    /// `subpath_hash` is the hash of the new subpath so far (including `path_component`).
-    /// `last` is true if this is the file name (i.e. leaf / last) component of the new path.
-    fn find_existing_subpath(
+    #[cfg(test)]
+    fn lookup_iter(
         &self,
-        subpath_hash: PathHash,
-        path_component: FilePathComponent<'_>,
-        parent_index: Option<PathComponentIndex>,
-        last: bool,
-    ) -> Option<SubpathComponent> {
-        self.subpath_lookup
-            .get(&subpath_hash)
-            .map(|existing_path_components| {
-                for &existing_path_component in existing_path_components {
-                    let existing_path = self.iter(
-                        existing_path_component.path_component_index,
-                        existing_path_component.component_type == SubpathComponentType::Extension,
-                    );
-                    let new_path = self.new_path_iter(path_component, parent_index, last);
-
-                    match existing_path.file_name {
-                        // Existing (sub)path is to a file extension.
-                        FileName::WithExtension {
-                            extension: existing_extension,
-                            file_stem: existing_file_stem,
-                        } => {
-                            debug_assert!(self.path_lookup.contains_key(&subpath_hash));
-
-                            match new_path.file_name {
-                                // New (sub)path is to a file extension - compare the strings directly.
-                                FileName::WithExtension {
-                                    extension: new_extension,
-                                    file_stem: new_file_stem,
-                                } => {
-                                    if new_extension != existing_extension
-                                        || new_file_stem != existing_file_stem
-                                    {
-                                        continue;
-                                    }
-                                }
-                                // New subpath is to a folder or file name (with no extension).
-                                FileName::NoExtension(new_file_name) => {
-                                    // Check the case where the new file or folder name string
-                                    // has the same form as the existing path file name with an extension.
-                                    //
-                                    // E.g.: new subpath is "foo/bar.txt/..." (`new_file_name` == "bar.txt"),
-                                    // existing (sub)path is "foo/bar.txt" (`file_stem` == "bar", `extension` == "txt").
-                                    // This must successfully match the subpath and return a `FileAlreadyExistsAtFolderPath` error.
-                                    if let Some(FileStemAndExtension {
-                                        extension: new_extension,
-                                        file_stem: new_file_stem,
-                                    }) = file_stem_and_extension(new_file_name)
-                                    {
-                                        if new_extension != existing_extension
-                                            || new_file_stem != existing_file_stem
-                                        {
-                                            continue;
-                                        }
-                                    // New file or folder name string does not have an "extension", so strings definitely don't match.
-                                    } else {
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-                        // Existing subpath is to a folder or file name (with no extension).
-                        FileName::NoExtension(existing_file_or_folder_name) => {
-                            match new_path.file_name {
-                                // New (sub)path is to a file extension.
-                                FileName::WithExtension {
-                                    file_stem: new_file_stem,
-                                    extension: new_extension,
-                                } => {
-                                    // Check the case where the existing file or folder name string
-                                    // has the same form as the new path file name with an extension.
-                                    //
-                                    // E.g.: existing subpath is "foo/bar.txt/..." (`file_or_folder_name` == "bar.txt"),
-                                    // new (sub)path is "foo/bar.txt" (`file_stem` == "bar", `extension` == "txt").
-                                    // This must successfully match the subpath and return a `FolderAlreadyExistsAtFilePath` error.
-                                    if let Some(FileStemAndExtension {
-                                        file_stem,
-                                        extension,
-                                    }) = file_stem_and_extension(existing_file_or_folder_name)
-                                    {
-                                        if new_extension != extension || new_file_stem != file_stem
-                                        {
-                                            continue;
-                                        }
-                                    // Existing file or folder name string does not have an "extension", so strings definitely don't match.
-                                    } else {
-                                        continue;
-                                    }
-                                }
-                                // New subpath is to a folder or file name (with no extension) - compare the strings directly.
-                                FileName::NoExtension(new_file_or_folder_name) => {
-                                    if existing_file_or_folder_name != new_file_or_folder_name {
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Compare the rest of the file paths.
-                    if existing_path.file_path.eq(new_path.file_path) {
-                        return Some(existing_path_component);
-                    }
-                }
-
-                None
-            })
-            .flatten()
+        hash: PathHash,
+    ) -> Option<FilePathIter<'_, impl Iterator<Item = FilePathComponent<'_>>>> {
+        self.path_lookup
+            .get(&hash)
+            .map(|lpc| self.iter(lpc.path_component, lpc.extension))
     }
 
-    /// Adds the new unique `path_component` with `parent_index` parent (if any)
-    /// to the lookup structures.
-    /// `subpath_hash` is the hash of the new subpath so far (including `path_component`).
-    /// `last` is true if this is the file name (i.e. leaf / last) component of the new path.
-    /// `string_len` is the full length of the file path string so far, separators included.
-    fn add_path_component(
-        &mut self,
-        subpath_hash: PathHash,
-        path_component: FilePathComponent<'_>,
-        parent_index: Option<PathComponentIndex>,
-        last: bool,
-        string_len: FullStringLength,
-        file_stem_hasher: &mut H::Hasher,
-    ) -> (PathComponentIndex, bool) {
-        let add_path_component_impl = |path_components: &mut PathComponents,
-                                       subpath_lookup: &mut SubpathLookup,
-                                       string_lookup: &mut StringLookup,
-                                       string_table: &mut StringTable,
-                                       strings: &mut String,
-                                       hasher: H::Hasher,
-                                       subpath_hash: PathHash,
-                                       path_component: &str,
-                                       parent_index: Option<PathComponentIndex>,
-                                       string_len: FullStringLength,
-                                       component_type: SubpathComponentType|
-         -> PathComponentIndex {
-            // Add the new path component to the lookup array, using the current parent index, if any.
-            let path_component =
-            // Get / intern the path component's string index in the string table.
-            PathComponent::new(Self::interned_string_index(
-                string_lookup,
-                string_table,
-                strings,
-                path_component,
-                hasher,
-            ), parent_index);
-
-            // All path components must be unique.
-            #[cfg(debug_assertions)]
-            {
-                for &path_component_ in path_components.iter() {
-                    debug_assert!(path_component_ != path_component);
-                }
-            }
-
-            let path_component_index = path_components.len() as PathComponentIndex;
-            path_components.push(path_component);
-
-            subpath_lookup.insert(
-                subpath_hash,
-                SubpathComponent {
-                    path_component_index,
-                    string_len,
-                    component_type,
-                },
-            );
-
-            path_component_index
-        };
-
-        match file_stem_and_extension(path_component) {
-            // Path component is a file name with an extension - insert two path components, for the file stem and the extension.
-            // Return the index of the extension path component.
-            Some(FileStemAndExtension {
-                file_stem,
-                extension,
-            }) if last => {
-                let file_stem_str = file_stem.map(NonEmptyStr::as_str).unwrap_or("");
-
-                file_stem_hasher.write(file_stem_str.as_bytes());
-                let file_stem_hash = file_stem_hasher.finish();
-
-                // Account for the extension string length (including the extension separator) for the file stem string length.
-                let extension_string_len = (extension.len() + 1) as FullStringLength;
-                debug_assert!(string_len >= extension_string_len);
-
-                let file_stem_path_component_index = add_path_component_impl(
-                    &mut self.path_components,
-                    &mut self.subpath_lookup,
-                    &mut self.string_lookup,
-                    &mut self.string_table,
-                    &mut self.strings,
-                    self.hash_builder.build_hasher(),
-                    file_stem_hash,
-                    file_stem_str,
-                    parent_index,
-                    string_len - extension_string_len,
-                    SubpathComponentType::FileStem,
-                );
-
-                let extension_path_component_index = add_path_component_impl(
-                    &mut self.path_components,
-                    &mut self.subpath_lookup,
-                    &mut self.string_lookup,
-                    &mut self.string_table,
-                    &mut self.strings,
-                    self.hash_builder.build_hasher(),
-                    subpath_hash,
-                    extension,
-                    Some(file_stem_path_component_index),
-                    string_len,
-                    SubpathComponentType::Extension,
-                );
-
-                // Update the file stem hasher with the extension to keep it up to date with the subpath hasher.
-                file_stem_hasher.write(".".as_bytes());
-                file_stem_hasher.write(extension.as_bytes());
-                debug_assert_eq!(file_stem_hasher.finish(), subpath_hash);
-
-                (extension_path_component_index, true)
-            }
-            // Path component is a folder name, or doesn't have an extension - insert one path component, for the folder / file name.
-            // Return the index of the path component.
-            None | Some(_) => {
-                let file_or_folder_name_component_index = add_path_component_impl(
-                    &mut self.path_components,
-                    &mut self.subpath_lookup,
-                    &mut self.string_lookup,
-                    &mut self.string_table,
-                    &mut self.strings,
-                    self.hash_builder.build_hasher(),
-                    subpath_hash,
-                    path_component,
-                    parent_index,
-                    string_len,
-                    SubpathComponentType::FileOrFolderName,
-                );
-
-                // Update the file stem hasher with the entire path components to keep it up to date with the subpath hasher.
-                file_stem_hasher.write(path_component.as_bytes());
-                debug_assert_eq!(file_stem_hasher.finish(), subpath_hash);
-
-                (file_or_folder_name_component_index, false)
-            }
-        }
-    }
-
-    /// Returns a (reverse) file path iterator for the path component at `index`.
-    /// The caller guarantees the path component `index` is valid.
+    /// Returns a (reverse) file path iterator for the path component at `index` with an optional `extension_index`.
+    /// The caller guarantees the path component `index` and `extension_index`, if any, are valid.
     fn iter(
         &self,
         index: PathComponentIndex,
-        is_extension: bool,
+        extension_index: Option<ExtensionIndex>,
     ) -> FilePathIter<'_, impl Iterator<Item = FilePathComponent<'_>>> {
-        let mut path_component = path_component_impl(&self.path_components, index);
+        let path_component = get_path_component(&self.path_components, index);
 
-        let file_name = if is_extension {
+        // If `extension_index` is `Some`, `path_component` is for the file stem.
+        let file_name = if let Some(extension_index) = extension_index {
             // Extensions may not be empty.
-            let extension = non_empty_string_impl(
+            let extension = get_non_empty_string(
                 &self.string_table,
                 &self.strings,
-                path_component.string_index,
+                get_extension(&self.extension_table, extension_index),
             );
-            // Leaf path components with an extension have a parent component (file stem).
-            let parent_index = unsafe { debug_unwrap(path_component.parent_index) };
-            path_component = path_component_impl(&self.path_components, parent_index);
             // File stems may be empty.
-            let file_stem = NonEmptyStr::new(string_impl(
+            let file_stem = NonEmptyStr::new(get_string(
                 &self.string_table,
                 &self.strings,
-                path_component.string_index,
+                path_component.string,
             ));
 
             FileName::WithExtension {
@@ -695,92 +759,299 @@ impl<H: BuildHasher> FileTreeWriter<H> {
             }
         } else {
             // File names (with no extension) may not be empty.
-            FileName::NoExtension(non_empty_string_impl(
+            FileName::NoExtension(get_non_empty_string(
                 &self.string_table,
                 &self.strings,
-                path_component.string_index,
+                path_component.string,
             ))
         };
 
         FilePathIter {
             file_name,
-            file_path: PathIter::new(
+            file_path: FolderIter::new(
                 &self.path_components,
+                &self.extension_table,
                 &self.string_table,
                 &self.strings,
-                path_component
-                    .parent_index
-                    .map(|parent_index| path_component_impl(&self.path_components, parent_index)),
+                path_component.parent,
             ),
         }
     }
 
-    /// Returns a (reverse) file path iterator for `cur_component` with `parent_index`.
-    /// The caller guarantees the `parent_index` is valid.
-    fn new_path_iter<'a>(
-        &'a self,
-        cur_component: FilePathComponent<'a>,
-        parent_index: Option<PathComponentIndex>,
-        last: bool,
-    ) -> FilePathIter<'_, impl Iterator<Item = FilePathComponent<'a>>> {
-        let file_name = if last {
-            if let Some(FileStemAndExtension {
-                file_stem,
+    /// Returns a (reverse) file path iterator for the folder path component at `index`,
+    /// treating the folder name as a potential file name with an extension.
+    ///
+    /// E.g. if `index` points to folder "bar.txt" in "foo/bar.txt/...", this will return an iterator
+    /// treating "bar.txt" as a file stem with extension, to match an actual inserted file name with extension like "foo/bar.txt".
+    fn folder_name_as_file_stem_and_extension_rev_iter(
+        &self,
+        index: PathComponentIndex,
+    ) -> FilePathIter<'_, impl Iterator<Item = FilePathComponent<'_>>> {
+        let path_component = get_path_component(&self.path_components, index);
+
+        // Folder names may not be empty.
+        let folder_name =
+            get_non_empty_string(&self.string_table, &self.strings, path_component.string);
+
+        let file_name = if let Some(FileStemAndExtension {
+            file_stem,
+            extension,
+        }) = file_stem_and_extension(folder_name)
+        {
+            FileName::WithExtension {
                 extension,
-            }) = file_stem_and_extension(cur_component)
-            {
-                FileName::WithExtension {
-                    extension,
-                    file_stem,
-                }
-            } else {
-                FileName::NoExtension(cur_component)
+                file_stem,
             }
         } else {
-            FileName::NoExtension(cur_component)
+            FileName::NoExtension(folder_name)
         };
 
         FilePathIter {
             file_name,
-            file_path: PathIter::new(
+            file_path: FolderIter::new(
                 &self.path_components,
+                &self.extension_table,
                 &self.string_table,
                 &self.strings,
-                parent_index
-                    .map(|parent_index| path_component_impl(&self.path_components, parent_index)),
+                path_component.parent,
             ),
         }
     }
 
-    /// Used for error reporting.
+    /// If `path_component` is a folder name with a dot in it, returns an existing subpath, if any,
+    /// for a file name with an extension which matches the string of the subpath for `path_component` with `parent_index`.
+    ///
+    /// E.g., this will return "foo/bar.txt" for folder name `path_component` "bar.txt" if we are inserting "foo/bar.txt/...".
+    fn find_file_name_with_extension_for_folder_name(
+        &self,
+        mut folder_name_hasher: H::Hasher,
+        path_component: PathComponentKind<'_>,
+        parent_index: Option<PathComponentIndex>,
+    ) -> Option<SubpathComponent> {
+        if let PathComponentKind::Folder(folder_name) = path_component {
+            file_stem_and_extension(folder_name)
+                .and_then(
+                    |FileStemAndExtension {
+                         file_stem,
+                         extension,
+                     }| {
+                        // Hash the folder name as if it were a file name with an extension (i.e. skip the dot. See `SubpathLookup`).
+                        folder_name_hasher.write(file_stem_str(&file_stem).as_bytes());
+                        folder_name_hasher.write(extension.as_bytes());
+                        let folder_name_hash = folder_name_hasher.finish();
+
+                        // Look only for subpaths for an extension.
+                        self.subpath_lookup.get(&folder_name_hash).map(|spcs| {
+                            (
+                                file_stem,
+                                extension,
+                                spcs.iter().filter(|spc| spc.is_extension()),
+                            )
+                        })
+                    },
+                )
+                .and_then(|(file_stem, extension, mut extension_spcs)| {
+                    extension_spcs
+                        .find(|extension_spc| {
+                            let exising_subpath = Self::string_rev_iter(
+                                &self.path_components,
+                                &self.extension_table,
+                                &self.string_table,
+                                &self.strings,
+                                extension_spc.path_component_or_file_stem_index,
+                                extension_spc.extension_index,
+                            );
+                            let new_subpath = iter::once(extension.as_str())
+                                .chain(iter::once(file_stem_str(&file_stem)))
+                                .chain(StringIter::new(
+                                    &self.path_components,
+                                    &self.extension_table,
+                                    &self.string_table,
+                                    &self.strings,
+                                    parent_index,
+                                    None,
+                                ));
+
+                            new_subpath.eq(exising_subpath)
+                        })
+                        .map(|extension_spc| *extension_spc)
+                })
+        } else {
+            None
+        }
+    }
+
+    /// Returns a (reverse) iterator over path component strings
+    /// (i.e. folder names, file names, (maybe empty) file stems and extensions)
+    /// for the path component at `index`.
+    ///
     /// The caller guarantees the path component `index` is valid.
+    fn string_rev_iter<'a>(
+        path_components: &'a [PathComponent],
+        extension_table: &'a [StringIndex],
+        string_table: &'a [InternedString],
+        strings: &'a String,
+        index: PathComponentIndex,
+        extension_index: Option<ExtensionIndex>,
+    ) -> impl Iterator<Item = &'a str> {
+        StringIter::new(
+            path_components,
+            extension_table,
+            string_table,
+            strings,
+            Some(index),
+            extension_index,
+        )
+    }
+
+    /// Attempts to find an existing subpath (i.e. a linked list of strings)
+    /// matching the `path_component`, `subpath_hash` and `parent_index`.
+    ///
+    /// The caller guarantees `subpath_hash` is the subpath hash for `path_component` (see `SubpathLookup`),
+    /// and that `parent_index`, if any, is valid.
+    fn reuse_subpath<'a>(
+        subpath_lookup: &'a mut SubpathLookup,
+        path_components: &[PathComponent],
+        extension_table: &[StringIndex],
+        string_table: &[InternedString],
+        strings: &String,
+        subpath_hash: PathHash,
+        path_component: &str,
+        parent_index: Option<PathComponentIndex>,
+    ) -> Option<&'a mut SubpathComponent> {
+        subpath_lookup.get_mut(&subpath_hash).and_then(|spcs| {
+            spcs.iter_mut().find(|spc| {
+                let existing_subpath = Self::string_rev_iter(
+                    path_components,
+                    extension_table,
+                    string_table,
+                    strings,
+                    spc.path_component_or_file_stem_index,
+                    spc.extension_index,
+                );
+                let new_subpath = iter::once(path_component).chain(StringIter::new(
+                    path_components,
+                    extension_table,
+                    string_table,
+                    strings,
+                    parent_index,
+                    None,
+                ));
+
+                new_subpath.eq(existing_subpath)
+            })
+        })
+    }
+
+    /// Adds the new unique `path_component` with `parent_index` parent (if any) to the lookup structures.
+    fn add_component(
+        path_components: &mut PathComponents,
+        string_lookup: &mut StringLookup,
+        string_table: &mut StringTable,
+        strings: &mut String,
+        hasher: H::Hasher,
+        path_component: PathComponentKind,
+        parent_index: Option<PathComponentIndex>,
+    ) -> PathComponentIndex {
+        // Add the new path component to the lookup array, using the current parent index, if any.
+        let path_component_ =
+            // Get / intern the path component's string index in the string table.
+            PathComponent::new(
+                Self::string_index(
+                    string_lookup,
+                    string_table,
+                    strings,
+                    path_component.as_str(),
+                    hasher,
+                ),
+                parent_index
+            );
+
+        // All path components must be unique.
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(!path_components.iter().any(|pc| *pc == path_component_));
+        }
+
+        let path_component_index = path_components.len() as PathComponentIndex;
+        path_components.push(path_component_);
+
+        path_component_index
+    }
+
+    /// Returns the index of the existing `extension` in the extension table, if it exists,
+    /// or adds it and returns its new index in the extension table.
+    fn extension_index(
+        string_lookup: &mut StringLookup,
+        string_table: &mut StringTable,
+        strings: &mut String,
+        extension_lookup: &mut ExtensionLookup,
+        extension_table: &mut ExtensionTable,
+        extension: FilePathComponent<'_>,
+        hash_builder: &H,
+    ) -> ExtensionIndex {
+        let extension_hash = {
+            let mut hasher = hash_builder.build_hasher();
+            hasher.write(extension.as_bytes());
+            hasher.finish()
+        };
+
+        extension_lookup
+            .get(&extension_hash)
+            .and_then(|extension_indices| {
+                extension_indices.iter().find(|&&extension_index| {
+                    get_string(
+                        string_table,
+                        strings,
+                        get_extension(extension_table, extension_index),
+                    ) == extension.as_str()
+                })
+            })
+            .map(|extension_index| *extension_index)
+            .unwrap_or_else(|| {
+                let extension_string_index = Self::string_index_with_hash(
+                    string_lookup,
+                    string_table,
+                    strings,
+                    extension.as_str(),
+                    extension_hash,
+                );
+                let extension_index = extension_table.len() as ExtensionIndex;
+                extension_table.push(extension_string_index);
+                extension_lookup.insert(extension_hash, extension_index);
+                extension_index
+            })
+    }
+
+    /// Used for error reporting.
+    /// The caller guarantees the path component `index` and the `extension_index`, if any, are valid.
     fn path_buf(
         &self,
         index: PathComponentIndex,
+        extension_index: Option<ExtensionIndex>,
         string_len: FullStringLength,
-        is_extension: bool,
     ) -> FilePathBuf {
-        self.build_path_string(index, string_len, is_extension, FilePathBuilder::new())
+        self.build_path_string(index, extension_index, string_len, FilePathBuilder::new())
     }
 
-    /// The caller guarantees the path component `index` is valid,
+    /// The caller guarantees the path component `index` and the `extension_index`, if any, are valid,
     /// and that `string_len` matches the actual string length.
     fn build_path_string(
         &self,
         index: PathComponentIndex,
+        extension_index: Option<ExtensionIndex>,
         string_len: FullStringLength,
-        is_extension: bool,
         builder: FilePathBuilder,
     ) -> FilePathBuf {
         let mut string = builder.into_inner();
-        build_path_string(self.iter(index, is_extension), string_len, &mut string);
+        build_path_string(self.iter(index, extension_index), string_len, &mut string);
         debug_assert!(!string.is_empty());
         unsafe { FilePathBuf::new_unchecked(string) }
     }
 
     /// Returns the string index of the interned `string` in the string table, if it is interned,
     /// or interns it and returns its new index in the string table.
-    fn interned_string_index(
+    fn string_index(
         string_lookup: &mut StringLookup,
         string_table: &mut StringTable,
         strings: &mut String,
@@ -791,23 +1062,35 @@ impl<H: BuildHasher> FileTreeWriter<H> {
         hasher.write(string.as_bytes());
         let string_hash = hasher.finish();
 
-        if let Some(string_index) = string_lookup
+        Self::string_index_with_hash(string_lookup, string_table, strings, string, string_hash)
+    }
+
+    /// Returns the string index of the interned `string` with `hash` in the string table, if it is interned,
+    /// or interns it and returns its new index in the string table.
+    ///
+    /// The caller guarantees `hash` is actually the `string`'s hash.
+    fn string_index_with_hash(
+        string_lookup: &mut StringLookup,
+        string_table: &mut StringTable,
+        strings: &mut String,
+        string: &str,
+        hash: PathHash,
+    ) -> StringIndex {
+        string_lookup
             // First lookup by string hash.
-            .get(&string_hash)
+            .get(&hash)
             // Then compare the strings.
-            .map(|string_indices| {
-                string_indices.iter().cloned().find(|&string_index| {
-                    string_impl(string_table, strings, string_index) == string
-                })
+            .and_then(|string_indices| {
+                string_indices
+                    .iter()
+                    .cloned()
+                    // If the `string` already exists - return its index.
+                    .find(|&string_index| get_string(string_table, strings, string_index) == string)
             })
-            .flatten()
-        {
-            // The `string` already exists - return its index.
-            string_index
-        } else {
             // Else the string does not exist - intern it and return its index.
-            Self::intern_string(string_lookup, string_table, strings, string, string_hash)
-        }
+            .unwrap_or_else(|| {
+                Self::intern_string(string_lookup, string_table, strings, string, hash)
+            })
     }
 
     /// Adds the unique `string` with `hash` to the lookup data structures and returns its index.
@@ -834,16 +1117,22 @@ impl<H: BuildHasher> FileTreeWriter<H> {
 }
 
 /// The caller guarantees the path component `index` is valid.
-fn path_component_impl(
+fn get_path_component(
     path_components: &[PathComponent],
     index: PathComponentIndex,
 ) -> PathComponent {
     debug_assert!((index as usize) < path_components.len());
-    unsafe { *path_components.get_unchecked(index as usize) }
+    *unsafe { path_components.get_unchecked(index as usize) }
+}
+
+/// The caller guarantees the extension `index` is valid.
+fn get_extension(extensions: &[StringIndex], index: ExtensionIndex) -> StringIndex {
+    debug_assert!((index as usize) < extensions.len());
+    *unsafe { extensions.get_unchecked(index as usize) }
 }
 
 /// The caller guarantees the string `index` is valid.
-fn string_impl<'s>(
+fn get_string<'s>(
     string_table: &[InternedString],
     strings: &'s String,
     index: StringIndex,
@@ -860,55 +1149,18 @@ fn string_impl<'s>(
 
 /// The caller guarantees the string `index` is valid,
 /// and that the string at `index` is non-empty (file stems may be empty).
-fn non_empty_string_impl<'s>(
+fn get_non_empty_string<'s>(
     string_table: &[InternedString],
     strings: &'s String,
     index: StringIndex,
 ) -> &'s NonEmptyStr {
-    let string = string_impl(string_table, strings, index);
+    let string = get_string(string_table, strings, index);
     debug_assert!(!string.is_empty());
     unsafe { NonEmptyStr::new_unchecked(string) }
 }
 
-struct PathIter<'a> {
-    path_components: &'a [PathComponent],
-    string_table: &'a [InternedString],
-    strings: &'a String,
-    cur_component: Option<PathComponent>,
-}
-
-impl<'a> PathIter<'a> {
-    fn new(
-        path_components: &'a [PathComponent],
-        string_table: &'a [InternedString],
-        strings: &'a String,
-        cur_component: Option<PathComponent>,
-    ) -> Self {
-        Self {
-            path_components,
-            string_table,
-            strings,
-            cur_component,
-        }
-    }
-}
-
-impl<'a> Iterator for PathIter<'a> {
-    type Item = FilePathComponent<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.cur_component.take().map(|cur_component| {
-            if let Some(parent_index) = cur_component.parent_index {
-                self.cur_component
-                    .replace(path_component_impl(self.path_components, parent_index));
-            }
-            non_empty_string_impl(self.string_table, self.strings, cur_component.string_index)
-        })
-    }
-}
-
-/// Returns a (reverse) file path iterator for the components of `path`.
-fn file_path_iter(
+/// Returns a (reverse) file path iterator over the components of `path`.
+fn file_path_rev_iter(
     path: &FilePath,
 ) -> FilePathIter<'_, impl Iterator<Item = FilePathComponent<'_>>> {
     let mut components = path.components().rev();
@@ -932,10 +1184,326 @@ fn file_path_iter(
     }
 }
 
+bitflags! {
+    /// Need to disambiguate between subpath components of different types to reuse them when possible,
+    /// and to handle `FolderAlreadyExistsAtFilePath` / `FileAlreadyExistsAtFolderPath` errors.
+    struct SubpathFlags: u8 {
+        const Extension = 0b0001;
+        const FileStem = 0b0010;
+        const FileName = 0b0100;
+        const FolderName = 0b1000;
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct SubpathComponent {
+    path_component_or_file_stem_index: PathComponentIndex,
+    extension_index: Option<ExtensionIndex>,
+    string_len: FullStringLength,
+    flags: SubpathFlags,
+}
+
+impl SubpathComponent {
+    fn new_folder(path_component: PathComponentIndex, string_len: FullStringLength) -> Self {
+        Self {
+            path_component_or_file_stem_index: path_component,
+            extension_index: None,
+            string_len,
+            flags: SubpathFlags::FolderName,
+        }
+    }
+
+    fn new_file_name(path_component: PathComponentIndex, string_len: FullStringLength) -> Self {
+        Self {
+            path_component_or_file_stem_index: path_component,
+            extension_index: None,
+            string_len,
+            flags: SubpathFlags::FileName,
+        }
+    }
+
+    fn new_file_stem(path_component: PathComponentIndex, string_len: FullStringLength) -> Self {
+        Self {
+            path_component_or_file_stem_index: path_component,
+            extension_index: None,
+            string_len,
+            flags: SubpathFlags::FileStem,
+        }
+    }
+
+    fn new_extension(
+        file_stem: PathComponentIndex,
+        extension: ExtensionIndex,
+        string_len: FullStringLength,
+    ) -> Self {
+        Self {
+            path_component_or_file_stem_index: file_stem,
+            extension_index: Some(extension),
+            string_len,
+            flags: SubpathFlags::Extension,
+        }
+    }
+
+    fn is_folder_name(&self) -> bool {
+        self.flags.contains(SubpathFlags::FolderName)
+    }
+
+    fn is_file_name(&self) -> bool {
+        self.flags.contains(SubpathFlags::FileName)
+    }
+
+    fn is_extension(&self) -> bool {
+        self.flags.contains(SubpathFlags::Extension)
+    }
+
+    // File stem or extension subpaths can be reused as file names.
+    fn reuse_as_file_name(&mut self) {
+        debug_assert!(!self.flags.contains(SubpathFlags::FileName));
+        debug_assert!(!self.flags.contains(SubpathFlags::FolderName));
+        debug_assert!(
+            self.flags.contains(SubpathFlags::FileStem)
+                || self.flags.contains(SubpathFlags::Extension)
+        );
+        self.flags.set(SubpathFlags::FileName, true);
+    }
+
+    // Folder name, file stem or extension subpaths can be reused as folder names.
+    fn reuse_as_folder_name(&mut self) {
+        debug_assert!(!self.flags.contains(SubpathFlags::FileName));
+        debug_assert!(
+            self.flags.contains(SubpathFlags::FolderName)
+                || self.flags.contains(SubpathFlags::FileStem)
+                || self.flags.contains(SubpathFlags::Extension)
+        );
+        self.flags.set(SubpathFlags::FolderName, true);
+    }
+
+    // Any component type may be reused as a file stem.
+    fn reuse_as_file_stem(&mut self) {
+        self.flags.set(SubpathFlags::FileStem, true);
+    }
+
+    // Folder name, file name or file stem subpaths can be reused as extensions.
+    fn reuse_as_extension(&mut self) {
+        debug_assert!(!self.flags.contains(SubpathFlags::Extension));
+        debug_assert!(
+            self.flags.contains(SubpathFlags::FolderName)
+                || self.flags.contains(SubpathFlags::FileName)
+                || self.flags.contains(SubpathFlags::FileStem)
+        );
+        debug_assert!(self.extension_index.is_none());
+        self.flags.set(SubpathFlags::Extension, true);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathComponentKind<'a> {
+    Folder(FilePathComponent<'a>),
+    FileName(FilePathComponent<'a>),
+    FileStem(Option<FilePathComponent<'a>>),
+    Extension(FilePathComponent<'a>),
+}
+
+impl<'a> PathComponentKind<'a> {
+    fn as_str(&self) -> &str {
+        match self {
+            PathComponentKind::Folder(folder) => folder.as_str(),
+            PathComponentKind::FileName(file_name) => file_name.as_str(),
+            PathComponentKind::FileStem(file_stem) => file_stem_str(file_stem),
+            PathComponentKind::Extension(extension) => extension.as_str(),
+        }
+    }
+}
+
+/// (Forward) iterator over folder names and file name / file stem and extension of the file `path`.
+/// Needs `num_components` to know when processing the last component of the file path and check for extension.
+struct PathComponentAndExtensionIter<'a, T> {
+    num_components: NumComponents,
+    extension: Option<FilePathComponent<'a>>,
+    components: T,
+}
+
+impl<'a, T> PathComponentAndExtensionIter<'a, T> {
+    fn new(components: T, num_components: NumComponents) -> Self {
+        Self {
+            num_components,
+            extension: None,
+            components,
+        }
+    }
+}
+
+impl<'a, T> Iterator for PathComponentAndExtensionIter<'a, T>
+where
+    T: Iterator<Item = FilePathComponent<'a>>,
+{
+    type Item = PathComponentKind<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(extension) = self.extension.take() {
+            debug_assert_eq!(self.num_components, 0);
+            Some(PathComponentKind::Extension(extension))
+        } else if self.num_components > 1 {
+            self.num_components -= 1;
+            self.components.next().map(PathComponentKind::Folder)
+        } else if self.num_components == 1 {
+            self.num_components -= 1;
+            self.components.next().map(|file_name| {
+                if let Some(FileStemAndExtension {
+                    file_stem,
+                    extension,
+                }) = file_stem_and_extension(file_name)
+                {
+                    self.extension.replace(extension);
+                    PathComponentKind::FileStem(file_stem)
+                } else {
+                    PathComponentKind::FileName(file_name)
+                }
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Returns a (forward) iterator over folder names and file name / file stem and extension of the file `path` with `num_components`.
+///
+/// E.g., for `"foo/bar/baz.txt"`, this will return `[Folder("foo"), Folder("bar"), FileStem("baz"), Extension("txt")]`;
+/// for `"foo/bar/baz"`, this will return `[Folder("foo"), Folder("bar"), FileName("baz")]`.
+///
+/// The caller guarantees `path` actually has `num_components`.
+fn path_component_and_extension_iter(
+    path: &FilePath,
+    num_components: NumComponents,
+) -> impl Iterator<Item = PathComponentKind<'_>> {
+    PathComponentAndExtensionIter::new(path.components(), num_components)
+}
+
+/// (Reverse) iterator over strings of file path components starting at `index`, if any
+/// (i.e. folder names, file names, (maybe empty) file stems and extensions).
+struct StringIter<'a> {
+    path_components: &'a [PathComponent],
+    extension_table: &'a [StringIndex],
+    string_table: &'a [InternedString],
+    strings: &'a String,
+    index: Option<PathComponentIndex>,
+    extension_index: Option<ExtensionIndex>,
+}
+
+impl<'a> StringIter<'a> {
+    /// The caller guarantees the path component `index` and `extension_index`, if any, are valid.
+    fn new(
+        path_components: &'a [PathComponent],
+        extension_table: &'a [StringIndex],
+        string_table: &'a [InternedString],
+        strings: &'a String,
+        index: Option<PathComponentIndex>,
+        extension_index: Option<ExtensionIndex>,
+    ) -> Self {
+        Self {
+            path_components,
+            extension_table,
+            string_table,
+            strings,
+            index,
+            extension_index,
+        }
+    }
+}
+
+impl<'a> Iterator for StringIter<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(extension_index) = self.extension_index.take() {
+            let extension_string_index = get_extension(self.extension_table, extension_index);
+            Some(get_string(
+                self.string_table,
+                self.strings,
+                extension_string_index,
+            ))
+        } else {
+            self.index.take().map(|index| {
+                let path_component = get_path_component(self.path_components, index);
+                if let Some(parent) = path_component.parent {
+                    self.index.replace(parent);
+                }
+                get_string(self.string_table, self.strings, path_component.string)
+            })
+        }
+    }
+}
+
+/// (Reverse) iterator over the (folder) file path components starting at some path component index.
+struct FolderIter<'a>(StringIter<'a>);
+
+impl<'a> FolderIter<'a> {
+    fn new(
+        path_components: &'a [PathComponent],
+        extension_table: &'a [StringIndex],
+        string_table: &'a [InternedString],
+        strings: &'a String,
+        index: Option<PathComponentIndex>,
+    ) -> Self {
+        Self(StringIter::new(
+            path_components,
+            extension_table,
+            string_table,
+            strings,
+            index,
+            None,
+        ))
+    }
+}
+
+impl<'a> Iterator for FolderIter<'a> {
+    type Item = FilePathComponent<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|s| {
+            // Folder names may not be empty.
+            debug_assert!(!s.is_empty());
+            unsafe { NonEmptyStr::new_unchecked(s) }
+        })
+    }
+}
+
+fn file_stem_str<'a>(file_stem: &'a Option<FilePathComponent<'_>>) -> &'a str {
+    file_stem.map(NonEmptyStr::as_str).unwrap_or("")
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
-    use {super::*, minifilepath_macro::filepath, seahash::SeaHasher};
+    use {super::*, minifilepath_macro::filepath, ministr_macro::nestr, seahash::SeaHasher};
+
+    #[test]
+    fn path_component_and_extension_iter_test() {
+        assert!(
+            path_component_and_extension_iter(filepath!("foo/bar"), 2).eq(vec![
+                PathComponentKind::Folder(nestr!("foo")),
+                PathComponentKind::FileName(nestr!("bar"))
+            ]
+            .into_iter())
+        );
+        assert!(
+            path_component_and_extension_iter(filepath!("foo/bar.txt"), 2).eq(vec![
+                PathComponentKind::Folder(nestr!("foo")),
+                PathComponentKind::FileStem(Some(nestr!("bar"))),
+                PathComponentKind::Extension(nestr!("txt")),
+            ]
+            .into_iter())
+        );
+        assert!(
+            path_component_and_extension_iter(filepath!("foo/bar/.txt"), 3).eq(vec![
+                PathComponentKind::Folder(nestr!("foo")),
+                PathComponentKind::Folder(nestr!("bar")),
+                PathComponentKind::FileStem(None),
+                PathComponentKind::Extension(nestr!("txt")),
+            ]
+            .into_iter())
+        );
+    }
 
     #[derive(Default)]
     struct BuildSeaHasher;
@@ -989,26 +1557,47 @@ mod tests {
         {
             let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
             writer.insert(filepath!("foo")).unwrap();
-            assert!(
-                matches!(writer.insert(filepath!("foo/bar")).err().unwrap(), FileTreeWriterError::FileAlreadyExistsAtFolderPath(x) if x.as_file_path() == filepath!("foo"))
+            assert_eq!(
+                writer.insert(filepath!("foo/bar")).err().unwrap(),
+                FileTreeWriterError::FileAlreadyExistsAtFolderPath(filepath!("foo").into())
             );
         }
         {
             let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
             writer.insert(filepath!("foo/bar")).unwrap();
-            assert!(
-                matches!(writer.insert(filepath!("foo/bar/baz")).err().unwrap(), FileTreeWriterError::FileAlreadyExistsAtFolderPath(x) if x.as_file_path() == filepath!("foo/bar"))
+            assert_eq!(
+                writer.insert(filepath!("foo/bar/baz")).err().unwrap(),
+                FileTreeWriterError::FileAlreadyExistsAtFolderPath(filepath!("foo/bar").into())
             );
         }
         {
             let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
             writer.insert(filepath!("foo/bar.txt")).unwrap();
-            assert!(
-                matches!(writer.insert(filepath!("foo/bar.txt/baz")).err().unwrap(), FileTreeWriterError::FileAlreadyExistsAtFolderPath(x) if x.as_file_path() == filepath!("foo/bar.txt"))
+            assert_eq!(
+                writer.insert(filepath!("foo/bar.txt/baz")).err().unwrap(),
+                FileTreeWriterError::FileAlreadyExistsAtFolderPath(filepath!("foo/bar.txt").into())
             );
+        }
+
+        // But this works.
+        {
+            let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
+            writer.insert(filepath!("foo/bar.txt/baz")).unwrap();
+            writer.insert(filepath!("foo/bar.txt/bob")).unwrap();
+        }
+        {
+            let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
+            writer.insert(filepath!("foo/bar/txt")).unwrap();
+            writer.insert(filepath!("foo/bar.txt/baz")).unwrap();
+        }
+        {
+            let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
+            writer.insert(filepath!("foo/bar/txt.cfg")).unwrap();
+            writer.insert(filepath!("foo/bar.txt/baz")).unwrap();
         }
     }
 
+    #[derive(Clone, Copy)]
     struct FNV1aHasher(u32);
 
     impl FNV1aHasher {
@@ -1123,6 +1712,7 @@ mod tests {
             // "foo/bill"
             //   1   2 <- hash collision, string mismatch
 
+            #[derive(Clone, Copy)]
             struct MockHasher(u64);
 
             impl Hasher for MockHasher {
@@ -1212,8 +1802,6 @@ mod tests {
 
     #[test]
     fn writer() {
-        use minifilepath_macro::filepath;
-
         let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
 
         assert_eq!(writer.len(), 0);
@@ -1244,6 +1832,1059 @@ mod tests {
             assert_eq!(result.as_file_path(), paths[idx]);
 
             builder = result.into_builder();
+        }
+    }
+
+    #[test]
+    fn reuse_file_name_as_file_name() {
+        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+
+        {
+            // Reuse file name "bar" as file name -> cannot happen, handled earlier by `PathAlreadyExists`
+
+            // subpaths: [ hash("foo"), hash("foo", "bar") ]
+            // bar: `SubpathFlags::FileOrFolderName`
+            let bar = writer.insert(filepath!("foo/bar")).unwrap();
+            assert_eq!(writer.len(), 1);
+            assert_eq!(writer.num_components(), 2);
+            assert_eq!(writer.num_subpaths(), 2);
+            assert_eq!(writer.num_extensions(), 0);
+            assert_eq!(writer.string_len(), 6);
+            assert_eq!(writer.lookup(bar).unwrap(), filepath!("foo/bar").into());
+            {
+                let bar = writer.lookup_iter(bar).unwrap();
+                assert_eq!(bar.file_name, FileName::NoExtension(nestr!("bar")));
+                assert!(bar.file_path.eq(vec![nestr!("foo")].into_iter()));
+            }
+            assert_eq!(
+                writer.insert(filepath!("foo/bar")).err().unwrap(),
+                FileTreeWriterError::PathAlreadyExists
+            );
+
+            writer.clear();
+        }
+
+        {
+            // Reuse file name "txt" as file name -> cannot happen, handled earlier by `PathAlreadyExists`
+
+            // subpaths: [ hash("foo.bar"), hash("foo.bar", "txt") ]
+            // bar: `SubpathFlags::FileOrFolderName`
+            let txt = writer.insert(filepath!("foo.bar/txt")).unwrap();
+            assert_eq!(writer.len(), 1);
+            assert_eq!(writer.num_components(), 2);
+            assert_eq!(writer.num_subpaths(), 2);
+            assert_eq!(writer.num_extensions(), 0);
+            assert_eq!(writer.string_len(), 10);
+            assert_eq!(writer.lookup(txt).unwrap(), filepath!("foo.bar/txt").into());
+            {
+                let txt = writer.lookup_iter(txt).unwrap();
+                assert_eq!(txt.file_name, FileName::NoExtension(nestr!("txt")));
+                assert!(txt.file_path.eq(vec![nestr!("foo.bar")].into_iter()));
+            }
+            assert_eq!(
+                writer.insert(filepath!("foo.bar/txt")).err().unwrap(),
+                FileTreeWriterError::PathAlreadyExists
+            );
+
+            writer.clear();
+        }
+    }
+
+    #[test]
+    fn reuse_folder_name_as_file_name() {
+        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+
+        {
+            // Reuse folder name "bar" as file name -> `FolderAlreadyExistsAtFilePath`
+
+            // subpaths: [ hash("foo"), hash("foo", "bar"), hash("foo", "bar", "txt") ]
+            // bar: `SubpathFlags::FileOrFolderName`
+            let txt = writer.insert(filepath!("foo/bar/txt")).unwrap();
+            assert_eq!(writer.len(), 1);
+            assert_eq!(writer.num_components(), 3);
+            assert_eq!(writer.num_subpaths(), 3);
+            assert_eq!(writer.num_extensions(), 0);
+            assert_eq!(writer.string_len(), 9);
+            assert_eq!(writer.lookup(txt).unwrap(), filepath!("foo/bar/txt").into());
+            {
+                let txt = writer.lookup_iter(txt).unwrap();
+                assert_eq!(txt.file_name, FileName::NoExtension(nestr!("txt")));
+                assert!(txt
+                    .file_path
+                    .eq(vec![nestr!("bar"), nestr!("foo")].into_iter()));
+            }
+            assert_eq!(
+                writer.insert(filepath!("foo/bar")).err().unwrap(),
+                FileTreeWriterError::FolderAlreadyExistsAtFilePath
+            );
+
+            writer.clear();
+        }
+
+        {
+            // Reuse folder name "bar.txt" as file name -> `FolderAlreadyExistsAtFilePath`
+
+            // subpaths: [ hash("foo"), hash("foo", "bar.txt"), hash("foo", "bar.txt", baz") ]
+            // bar: `SubpathFlags::FileOrFolderName`
+            let baz = writer.insert(filepath!("foo/bar.txt/baz")).unwrap();
+            assert_eq!(writer.len(), 1);
+            assert_eq!(writer.num_components(), 3);
+            assert_eq!(writer.num_subpaths(), 3);
+            assert_eq!(writer.num_extensions(), 0);
+            assert_eq!(writer.string_len(), 13);
+            assert_eq!(
+                writer.lookup(baz).unwrap(),
+                filepath!("foo/bar.txt/baz").into()
+            );
+            {
+                let cfg = writer.lookup_iter(baz).unwrap();
+                assert_eq!(cfg.file_name, FileName::NoExtension(nestr!("baz")));
+                assert!(cfg
+                    .file_path
+                    .eq(vec![nestr!("bar.txt"), nestr!("foo")].into_iter()));
+            }
+            assert_eq!(
+                writer.insert(filepath!("foo/bar.txt")).err().unwrap(),
+                FileTreeWriterError::FolderAlreadyExistsAtFilePath
+            );
+
+            writer.clear();
+        }
+    }
+
+    #[test]
+    fn reuse_file_stem_as_file_name() {
+        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+
+        // Reuse file stem "bar" as file name.
+
+        // subpaths: [ hash("foo"), hash("foo", "bar"), hash("foo", "bar", "txt") ]
+        // bar: `SubpathFlags::FileStem`
+        let bar_txt = writer.insert(filepath!("foo/bar.txt")).unwrap();
+        assert_eq!(writer.len(), 1);
+        assert_eq!(writer.num_components(), 2);
+        assert_eq!(writer.num_subpaths(), 3);
+        assert_eq!(writer.num_extensions(), 1);
+        assert_eq!(writer.string_len(), 9);
+        assert_eq!(
+            writer.lookup(bar_txt).unwrap(),
+            filepath!("foo/bar.txt").into()
+        );
+        {
+            let bar_txt = writer.lookup_iter(bar_txt).unwrap();
+            assert_eq!(
+                bar_txt.file_name,
+                FileName::WithExtension {
+                    extension: nestr!("txt"),
+                    file_stem: Some(nestr!("bar"))
+                }
+            );
+            assert!(bar_txt.file_path.eq(vec![nestr!("foo")].into_iter()));
+        }
+
+        // bar |= `SubpathFlags::FileOrFolderName`
+        let bar = writer.insert(filepath!("foo/bar")).unwrap();
+        assert_eq!(writer.len(), 2);
+        assert_eq!(writer.num_components(), 2);
+        assert_eq!(writer.num_subpaths(), 3);
+        assert_eq!(writer.num_extensions(), 1);
+        assert_eq!(writer.string_len(), 9);
+        assert_eq!(writer.lookup(bar).unwrap(), filepath!("foo/bar").into());
+        {
+            let bar = writer.lookup_iter(bar).unwrap();
+            assert_eq!(bar.file_name, FileName::NoExtension(nestr!("bar")));
+            assert!(bar.file_path.eq(vec![nestr!("foo")].into_iter()));
+        }
+    }
+
+    #[test]
+    fn reuse_extension_as_file_name() {
+        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+
+        {
+            // Reuse extension "bar" as file name.
+
+            // subpaths: [ hash("foo"), hash("foo", "bar") ]
+            // bar: `SubpathFlags::Extension`
+            let foo_bar = writer.insert(filepath!("foo.bar")).unwrap();
+            assert_eq!(writer.len(), 1);
+            assert_eq!(writer.num_components(), 1);
+            assert_eq!(writer.num_subpaths(), 2);
+            assert_eq!(writer.num_extensions(), 1);
+            assert_eq!(writer.string_len(), 6);
+            assert_eq!(writer.lookup(foo_bar).unwrap(), filepath!("foo.bar").into());
+            {
+                let mut foo_bar = writer.lookup_iter(foo_bar).unwrap();
+                assert_eq!(
+                    foo_bar.file_name,
+                    FileName::WithExtension {
+                        extension: nestr!("bar"),
+                        file_stem: Some(nestr!("foo"))
+                    }
+                );
+                assert!(foo_bar.file_path.next().is_none());
+            }
+
+            // bar |= `SubpathFlags::FileOrFolderName`
+            let bar = writer.insert(filepath!("foo/bar")).unwrap();
+            assert_eq!(writer.len(), 2);
+            assert_eq!(writer.num_components(), 2);
+            assert_eq!(writer.num_subpaths(), 2);
+            assert_eq!(writer.num_extensions(), 1);
+            assert_eq!(writer.string_len(), 6);
+            assert_eq!(writer.lookup(bar).unwrap(), filepath!("foo/bar").into());
+            {
+                let bar = writer.lookup_iter(bar).unwrap();
+                assert_eq!(bar.file_name, FileName::NoExtension(nestr!("bar")));
+                assert!(bar.file_path.eq(vec![nestr!("foo")].into_iter()));
+            }
+
+            writer.clear();
+        }
+
+        {
+            // Reuse extension "txt" as file name (and file stem "bar" as folder name).
+
+            // subpaths: [ hash("foo"), hash("foo", "bar"), hash("foo", "bar", "txt") ]
+            // bar: `SubpathFlags::FileStem`
+            // txt: `SubpathFlags::Extension`
+            let bar_txt = writer.insert(filepath!("foo/bar.txt")).unwrap();
+            assert_eq!(writer.len(), 1);
+            assert_eq!(writer.num_components(), 2);
+            assert_eq!(writer.num_subpaths(), 3);
+            assert_eq!(writer.num_extensions(), 1);
+            assert_eq!(writer.string_len(), 9);
+            assert_eq!(
+                writer.lookup(bar_txt).unwrap(),
+                filepath!("foo/bar.txt").into()
+            );
+            {
+                let bar_txt = writer.lookup_iter(bar_txt).unwrap();
+                assert_eq!(
+                    bar_txt.file_name,
+                    FileName::WithExtension {
+                        extension: nestr!("txt"),
+                        file_stem: Some(nestr!("bar"))
+                    }
+                );
+                assert!(bar_txt.file_path.eq(vec![nestr!("foo")].into_iter()));
+            }
+
+            // bar |= `SubpathFlags::FileOrFolderName`
+            // txt |= `SubpathFlags::FileOrFolderName`
+            let txt = writer.insert(filepath!("foo/bar/txt")).unwrap();
+            assert_eq!(writer.len(), 2);
+            assert_eq!(writer.num_components(), 3);
+            assert_eq!(writer.num_subpaths(), 3);
+            assert_eq!(writer.num_extensions(), 1);
+            assert_eq!(writer.string_len(), 9);
+            assert_eq!(writer.lookup(txt).unwrap(), filepath!("foo/bar/txt").into());
+            {
+                let txt = writer.lookup_iter(txt).unwrap();
+                assert_eq!(txt.file_name, FileName::NoExtension(nestr!("txt")));
+                assert!(txt
+                    .file_path
+                    .eq(vec![nestr!("bar"), nestr!("foo")].into_iter()));
+            }
+
+            writer.clear();
+        }
+    }
+
+    #[test]
+    fn reuse_file_name_as_folder_name() {
+        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+
+        // Reuse file name "bar" as folder name -> `FileAlreadyExistsAtFolderPath("foo/bar")`
+
+        // subpaths: [ hash("foo"), hash("foo", "bar") ]
+        // bar: `SubpathFlags::FileOrFolderName`
+        let bar = writer.insert(filepath!("foo/bar")).unwrap();
+        assert_eq!(writer.len(), 1);
+        assert_eq!(writer.num_components(), 2);
+        assert_eq!(writer.num_subpaths(), 2);
+        assert_eq!(writer.num_extensions(), 0);
+        assert_eq!(writer.string_len(), 6);
+        assert_eq!(writer.lookup(bar).unwrap(), filepath!("foo/bar").into());
+        {
+            let bar = writer.lookup_iter(bar).unwrap();
+            assert_eq!(bar.file_name, FileName::NoExtension(nestr!("bar")));
+            assert!(bar.file_path.eq(vec![nestr!("foo")].into_iter()));
+        }
+        assert_eq!(
+            writer.insert(filepath!("foo/bar/txt")).err().unwrap(),
+            FileTreeWriterError::FileAlreadyExistsAtFolderPath(filepath!("foo/bar").into())
+        );
+    }
+
+    #[test]
+    fn reuse_folder_name_as_folder_name() {
+        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+
+        // Reuse folder names "foo", "bar" as folder names (the usual case).
+
+        // subpaths: [ hash("foo"), hash("foo", "bar"), hash("foo", "bar", "txt") ]
+        // foo, bar: `SubpathFlags::FileOrFolderName`
+        let txt = writer.insert(filepath!("foo/bar/txt")).unwrap();
+        assert_eq!(writer.len(), 1);
+        assert_eq!(writer.num_components(), 3);
+        assert_eq!(writer.num_subpaths(), 3);
+        assert_eq!(writer.num_extensions(), 0);
+        assert_eq!(writer.string_len(), 9);
+        assert_eq!(writer.lookup(txt).unwrap(), filepath!("foo/bar/txt").into());
+        {
+            let txt = writer.lookup_iter(txt).unwrap();
+            assert_eq!(txt.file_name, FileName::NoExtension(nestr!("txt")));
+            assert!(txt
+                .file_path
+                .eq(vec![nestr!("bar"), nestr!("foo")].into_iter()));
+        }
+
+        let cfg = writer.insert(filepath!("foo/bar/cfg")).unwrap();
+        assert_eq!(writer.len(), 2);
+        assert_eq!(writer.num_components(), 4);
+        assert_eq!(writer.num_subpaths(), 4);
+        assert_eq!(writer.num_extensions(), 0);
+        assert_eq!(writer.string_len(), 12);
+        assert_eq!(writer.lookup(cfg).unwrap(), filepath!("foo/bar/cfg").into());
+        {
+            let cfg = writer.lookup_iter(cfg).unwrap();
+            assert_eq!(cfg.file_name, FileName::NoExtension(nestr!("cfg")));
+            assert!(cfg
+                .file_path
+                .eq(vec![nestr!("bar"), nestr!("foo")].into_iter()));
+        }
+    }
+
+    #[test]
+    fn reuse_file_stem_as_folder_name() {
+        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+
+        // Reuse file stem "bar" as folder name (and extension "txt" as file name).
+
+        // subpaths: [ hash("foo"), hash("foo", "bar"), hash("foo", "bar", "txt") ]
+        // bar: `SubpathFlags::FileStem`
+        // txt: `SubpathFlags::Extension`
+        let bar_txt = writer.insert(filepath!("foo/bar.txt")).unwrap();
+        assert_eq!(writer.len(), 1);
+        assert_eq!(writer.num_components(), 2);
+        assert_eq!(writer.num_subpaths(), 3);
+        assert_eq!(writer.num_extensions(), 1);
+        assert_eq!(writer.string_len(), 9);
+        assert_eq!(
+            writer.lookup(bar_txt).unwrap(),
+            filepath!("foo/bar.txt").into()
+        );
+        {
+            let bar_txt = writer.lookup_iter(bar_txt).unwrap();
+            assert_eq!(
+                bar_txt.file_name,
+                FileName::WithExtension {
+                    extension: nestr!("txt"),
+                    file_stem: Some(nestr!("bar"))
+                }
+            );
+            assert!(bar_txt.file_path.eq(vec![nestr!("foo")].into_iter()));
+        }
+
+        // bar |= `SubpathFlags::FileOrFolderName`
+        // txt |= `SubpathFlags::FileOrFolderName`
+        let txt = writer.insert(filepath!("foo/bar/txt")).unwrap();
+        assert_eq!(writer.len(), 2);
+        assert_eq!(writer.num_components(), 3);
+        assert_eq!(writer.num_subpaths(), 3);
+        assert_eq!(writer.num_extensions(), 1);
+        assert_eq!(writer.string_len(), 9);
+        assert_eq!(writer.lookup(txt).unwrap(), filepath!("foo/bar/txt").into());
+        {
+            let txt = writer.lookup_iter(txt).unwrap();
+            assert_eq!(txt.file_name, FileName::NoExtension(nestr!("txt")));
+            assert!(txt
+                .file_path
+                .eq(vec![nestr!("bar"), nestr!("foo")].into_iter()));
+        }
+    }
+
+    #[test]
+    fn reuse_extension_as_folder_name() {
+        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+
+        {
+            // Reuse extension "bar" as folder name (and file stem "foo" as folder name).
+
+            // subpaths: [ hash("foo"), hash("foo", "bar") ]
+            // bar: `SubpathFlags::Extension`
+            let foo_bar = writer.insert(filepath!("foo.bar")).unwrap();
+            assert_eq!(writer.len(), 1);
+            assert_eq!(writer.num_components(), 1);
+            assert_eq!(writer.num_subpaths(), 2);
+            assert_eq!(writer.num_extensions(), 1);
+            assert_eq!(writer.string_len(), 6);
+            assert_eq!(writer.lookup(foo_bar).unwrap(), filepath!("foo.bar").into());
+            {
+                let mut foo_bar = writer.lookup_iter(foo_bar).unwrap();
+                assert_eq!(
+                    foo_bar.file_name,
+                    FileName::WithExtension {
+                        extension: nestr!("bar"),
+                        file_stem: Some(nestr!("foo"))
+                    }
+                );
+                assert!(foo_bar.file_path.next().is_none());
+            }
+
+            // foo |= `SubpathFlags::FileOrFolderName`
+            // bar |= `SubpathFlags::FileOrFolderName`
+            let txt = writer.insert(filepath!("foo/bar/txt")).unwrap();
+            assert_eq!(writer.len(), 2);
+            assert_eq!(writer.num_components(), 3);
+            assert_eq!(writer.num_subpaths(), 3);
+            assert_eq!(writer.num_extensions(), 1);
+            assert_eq!(writer.string_len(), 9);
+            assert_eq!(writer.lookup(txt).unwrap(), filepath!("foo/bar/txt").into());
+            {
+                let txt = writer.lookup_iter(txt).unwrap();
+                assert_eq!(txt.file_name, FileName::NoExtension(nestr!("txt")));
+                assert!(txt
+                    .file_path
+                    .eq(vec![nestr!("bar"), nestr!("foo")].into_iter()));
+            }
+
+            writer.clear();
+        }
+
+        {
+            // Reuse extension "txt" as folder name name (and file stem "bar" as folder name).
+
+            // subpaths: [ hash("foo"), hash("foo", "bar"), hash("foo", "bar", "txt") ]
+            // bar: `SubpathFlags::FileStem`
+            // txt: `SubpathFlags::Extension`
+            let bar_txt = writer.insert(filepath!("foo/bar.txt")).unwrap();
+            assert_eq!(writer.len(), 1);
+            assert_eq!(writer.num_components(), 2);
+            assert_eq!(writer.num_subpaths(), 3);
+            assert_eq!(writer.num_extensions(), 1);
+            assert_eq!(writer.string_len(), 9);
+            assert_eq!(
+                writer.lookup(bar_txt).unwrap(),
+                filepath!("foo/bar.txt").into()
+            );
+            {
+                let bar_txt = writer.lookup_iter(bar_txt).unwrap();
+                assert_eq!(
+                    bar_txt.file_name,
+                    FileName::WithExtension {
+                        extension: nestr!("txt"),
+                        file_stem: Some(nestr!("bar"))
+                    }
+                );
+                assert!(bar_txt.file_path.eq(vec![nestr!("foo")].into_iter()));
+            }
+
+            // bar |= `SubpathFlags::FileOrFolderName`
+            // txt |= `SubpathFlags::FileOrFolderName`
+            let cfg = writer.insert(filepath!("foo/bar/txt/cfg")).unwrap();
+            assert_eq!(writer.len(), 2);
+            assert_eq!(writer.num_components(), 4);
+            assert_eq!(writer.num_subpaths(), 4);
+            assert_eq!(writer.num_extensions(), 1);
+            assert_eq!(writer.string_len(), 12);
+            assert_eq!(
+                writer.lookup(cfg).unwrap(),
+                filepath!("foo/bar/txt/cfg").into()
+            );
+            {
+                let cfg = writer.lookup_iter(cfg).unwrap();
+                assert_eq!(cfg.file_name, FileName::NoExtension(nestr!("cfg")));
+                assert!(cfg
+                    .file_path
+                    .eq(vec![nestr!("txt"), nestr!("bar"), nestr!("foo")].into_iter()));
+            }
+
+            writer.clear();
+        }
+    }
+
+    #[test]
+    fn reuse_file_name_as_file_stem() {
+        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+
+        // Reuse file name "bar" as file stem.
+
+        // subpaths: [ hash("foo"), hash("foo", "bar") ]
+        // bar: `SubpathFlags::FileOrFolderName`
+        let bar = writer.insert(filepath!("foo/bar")).unwrap();
+        assert_eq!(writer.len(), 1);
+        assert_eq!(writer.num_components(), 2);
+        assert_eq!(writer.num_subpaths(), 2);
+        assert_eq!(writer.num_extensions(), 0);
+        assert_eq!(writer.string_len(), 6);
+        assert_eq!(writer.lookup(bar).unwrap(), filepath!("foo/bar").into());
+        {
+            let bar = writer.lookup_iter(bar).unwrap();
+            assert_eq!(bar.file_name, FileName::NoExtension(nestr!("bar")));
+            assert!(bar.file_path.eq(vec![nestr!("foo")].into_iter()));
+        }
+
+        // bar |= `SubpathFlags::FileStem`
+        let bar_txt = writer.insert(filepath!("foo/bar.txt")).unwrap();
+        assert_eq!(writer.len(), 2);
+        assert_eq!(writer.num_components(), 2);
+        assert_eq!(writer.num_subpaths(), 3);
+        assert_eq!(writer.num_extensions(), 1);
+        assert_eq!(writer.string_len(), 9);
+        assert_eq!(
+            writer.lookup(bar_txt).unwrap(),
+            filepath!("foo/bar.txt").into()
+        );
+        {
+            let bar_txt = writer.lookup_iter(bar_txt).unwrap();
+            assert_eq!(
+                bar_txt.file_name,
+                FileName::WithExtension {
+                    extension: nestr!("txt"),
+                    file_stem: Some(nestr!("bar"))
+                }
+            );
+            assert!(bar_txt.file_path.eq(vec![nestr!("foo")].into_iter()));
+        }
+    }
+
+    #[test]
+    fn reuse_folder_name_as_file_stem() {
+        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+
+        // Reuse folder name "bar" as file stem (and file name "txt" as extension).
+
+        // subpaths: [ hash("foo"), hash("foo", "bar"), hash("foo", "bar", "txt") ]
+        // bar: `SubpathFlags::FileOrFolderName`
+        // txt: `SubpathFlags::FileOrFolderName`
+        let txt = writer.insert(filepath!("foo/bar/txt")).unwrap();
+        assert_eq!(writer.len(), 1);
+        assert_eq!(writer.num_components(), 3);
+        assert_eq!(writer.num_subpaths(), 3);
+        assert_eq!(writer.num_extensions(), 0);
+        assert_eq!(writer.string_len(), 9);
+        assert_eq!(writer.lookup(txt).unwrap(), filepath!("foo/bar/txt").into());
+        {
+            let txt = writer.lookup_iter(txt).unwrap();
+            assert_eq!(txt.file_name, FileName::NoExtension(nestr!("txt")));
+            assert!(txt
+                .file_path
+                .eq(vec![nestr!("bar"), nestr!("foo")].into_iter()));
+        }
+
+        // bar |= `SubpathFlags::FileStem`
+        // txt |= `SubpathFlags::Extension`
+        let bar_txt = writer.insert(filepath!("foo/bar.txt")).unwrap();
+        assert_eq!(writer.len(), 2);
+        assert_eq!(writer.num_components(), 3);
+        assert_eq!(writer.num_subpaths(), 3);
+        assert_eq!(writer.num_extensions(), 1);
+        assert_eq!(writer.string_len(), 9);
+        assert_eq!(
+            writer.lookup(bar_txt).unwrap(),
+            filepath!("foo/bar.txt").into()
+        );
+        {
+            let bar_txt = writer.lookup_iter(bar_txt).unwrap();
+            assert_eq!(
+                bar_txt.file_name,
+                FileName::WithExtension {
+                    extension: nestr!("txt"),
+                    file_stem: Some(nestr!("bar"))
+                }
+            );
+            assert!(bar_txt.file_path.eq(vec![nestr!("foo")].into_iter()));
+        }
+    }
+
+    #[test]
+    fn reuse_file_stem_as_file_stem() {
+        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+
+        {
+            // Reuse file stem "bar" as file stem.
+
+            // subpaths: [ hash("foo"), hash("foo", "bar"), hash("foo", "bar", "txt") ]
+            // bar: `SubpathFlags::Extension`
+            let bar_txt = writer.insert(filepath!("foo/bar.txt")).unwrap();
+            assert_eq!(writer.len(), 1);
+            assert_eq!(writer.num_components(), 2);
+            assert_eq!(writer.num_subpaths(), 3);
+            assert_eq!(writer.num_extensions(), 1);
+            assert_eq!(writer.string_len(), 9);
+            assert_eq!(
+                writer.lookup(bar_txt).unwrap(),
+                filepath!("foo/bar.txt").into()
+            );
+            {
+                let bar_txt = writer.lookup_iter(bar_txt).unwrap();
+                assert_eq!(
+                    bar_txt.file_name,
+                    FileName::WithExtension {
+                        extension: nestr!("txt"),
+                        file_stem: Some(nestr!("bar"))
+                    }
+                );
+                assert!(bar_txt.file_path.eq(vec![nestr!("foo")].into_iter()));
+            }
+
+            // subpaths += hash("foo", "bar", "cfg")
+            let bar_cfg = writer.insert(filepath!("foo/bar.cfg")).unwrap();
+            assert_eq!(writer.len(), 2);
+            assert_eq!(writer.num_components(), 2);
+            assert_eq!(writer.num_subpaths(), 4);
+            assert_eq!(writer.num_extensions(), 2);
+            assert_eq!(writer.string_len(), 12);
+            assert_eq!(
+                writer.lookup(bar_cfg).unwrap(),
+                filepath!("foo/bar.cfg").into()
+            );
+            {
+                let bar_cfg = writer.lookup_iter(bar_cfg).unwrap();
+                assert_eq!(
+                    bar_cfg.file_name,
+                    FileName::WithExtension {
+                        extension: nestr!("cfg"),
+                        file_stem: Some(nestr!("bar"))
+                    }
+                );
+                assert!(bar_cfg.file_path.eq(vec![nestr!("foo")].into_iter()));
+            }
+
+            writer.clear();
+        }
+
+        {
+            // Reuse empty file stem "" as file stem.
+
+            // subpaths: [ hash("foo"), hash("foo", ""), hash("foo", "", "txt") ]
+            // bar: `SubpathFlags::Extension`
+            let _txt = writer.insert(filepath!("foo/.txt")).unwrap();
+            assert_eq!(writer.len(), 1);
+            assert_eq!(writer.num_components(), 2);
+            assert_eq!(writer.num_subpaths(), 3);
+            assert_eq!(writer.num_extensions(), 1);
+            assert_eq!(writer.string_len(), 6);
+            assert_eq!(writer.lookup(_txt).unwrap(), filepath!("foo/.txt").into());
+            {
+                let _txt = writer.lookup_iter(_txt).unwrap();
+                assert_eq!(
+                    _txt.file_name,
+                    FileName::WithExtension {
+                        extension: nestr!("txt"),
+                        file_stem: None
+                    }
+                );
+                assert!(_txt.file_path.eq(vec![nestr!("foo")].into_iter()));
+            }
+
+            // subpaths += hash("foo", "", "cfg")
+            let _cfg = writer.insert(filepath!("foo/.cfg")).unwrap();
+            assert_eq!(writer.len(), 2);
+            assert_eq!(writer.num_components(), 2);
+            assert_eq!(writer.num_subpaths(), 4);
+            assert_eq!(writer.num_extensions(), 2);
+            assert_eq!(writer.string_len(), 9);
+            assert_eq!(writer.lookup(_cfg).unwrap(), filepath!("foo/.cfg").into());
+            {
+                let _cfg = writer.lookup_iter(_cfg).unwrap();
+                assert_eq!(
+                    _cfg.file_name,
+                    FileName::WithExtension {
+                        extension: nestr!("cfg"),
+                        file_stem: None
+                    }
+                );
+                assert!(_cfg.file_path.eq(vec![nestr!("foo")].into_iter()));
+            }
+
+            writer.clear();
+        }
+    }
+
+    #[test]
+    fn reuse_extension_as_file_stem() {
+        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+
+        // Reuse extension "txt" as file stem (and file stem "bar" as folder name).
+
+        // subpaths: [ hash("foo"), hash("foo", "bar"), hash("foo", "bar", "txt") ]
+        // bar: `SubpathFlags::FileStem`
+        // txt: `SubpathFlags::Extension`
+        let bar_txt = writer.insert(filepath!("foo/bar.txt")).unwrap();
+        assert_eq!(writer.len(), 1);
+        assert_eq!(writer.num_components(), 2);
+        assert_eq!(writer.num_subpaths(), 3);
+        assert_eq!(writer.num_extensions(), 1);
+        assert_eq!(writer.string_len(), 9);
+        assert_eq!(
+            writer.lookup(bar_txt).unwrap(),
+            filepath!("foo/bar.txt").into()
+        );
+        {
+            let bar_txt = writer.lookup_iter(bar_txt).unwrap();
+            assert_eq!(
+                bar_txt.file_name,
+                FileName::WithExtension {
+                    extension: nestr!("txt"),
+                    file_stem: Some(nestr!("bar"))
+                }
+            );
+            assert!(bar_txt.file_path.eq(vec![nestr!("foo")].into_iter()));
+        }
+
+        // subpaths += hash("foo", "bar", "txt", "cfg")
+        // bar |= `SubpathFlags::FileOrFolderName`
+        // txt |= `SubpathFlags::FileStem`
+        let txt_cfg = writer.insert(filepath!("foo/bar/txt.cfg")).unwrap();
+        assert_eq!(writer.len(), 2);
+        assert_eq!(writer.num_components(), 3);
+        assert_eq!(writer.num_subpaths(), 4);
+        assert_eq!(writer.num_extensions(), 2);
+        assert_eq!(writer.string_len(), 12);
+        assert_eq!(
+            writer.lookup(txt_cfg).unwrap(),
+            filepath!("foo/bar/txt.cfg").into()
+        );
+        {
+            let txt_cfg = writer.lookup_iter(txt_cfg).unwrap();
+            assert_eq!(
+                txt_cfg.file_name,
+                FileName::WithExtension {
+                    extension: nestr!("cfg"),
+                    file_stem: Some(nestr!("txt"))
+                }
+            );
+            assert!(txt_cfg
+                .file_path
+                .eq(vec![nestr!("bar"), nestr!("foo")].into_iter()));
+        }
+
+        writer.clear();
+    }
+
+    #[test]
+    fn reuse_file_name_as_extension() {
+        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+
+        {
+            // Reuse file name "bar" as extension (and folder name "foo" as file stem).
+
+            // subpaths: [ hash("foo"), hash("foo", "bar") ]
+            // foo: `SubpathFlags::FileOrFolderName`
+            // bar: `SubpathFlags::FileOrFolderName`
+            let bar = writer.insert(filepath!("foo/bar")).unwrap();
+            assert_eq!(writer.len(), 1);
+            assert_eq!(writer.num_components(), 2);
+            assert_eq!(writer.num_subpaths(), 2);
+            assert_eq!(writer.num_extensions(), 0);
+            assert_eq!(writer.string_len(), 6);
+            assert_eq!(writer.lookup(bar).unwrap(), filepath!("foo/bar").into());
+            {
+                let bar = writer.lookup_iter(bar).unwrap();
+                assert_eq!(bar.file_name, FileName::NoExtension(nestr!("bar")));
+                assert!(bar.file_path.eq(vec![nestr!("foo")].into_iter()));
+            }
+
+            // foo |= `SubpathFlags::FileStem`
+            // bar |= `SubpathFlags::Extension`
+            let foo_bar = writer.insert(filepath!("foo.bar")).unwrap();
+            assert_eq!(writer.len(), 2);
+            assert_eq!(writer.num_components(), 2);
+            assert_eq!(writer.num_subpaths(), 2);
+            assert_eq!(writer.num_extensions(), 1);
+            assert_eq!(writer.string_len(), 6);
+            assert_eq!(writer.lookup(foo_bar).unwrap(), filepath!("foo.bar").into());
+            {
+                let mut foo_bar = writer.lookup_iter(foo_bar).unwrap();
+                assert_eq!(
+                    foo_bar.file_name,
+                    FileName::WithExtension {
+                        extension: nestr!("bar"),
+                        file_stem: Some(nestr!("foo"))
+                    }
+                );
+                assert!(foo_bar.file_path.next().is_none());
+            }
+
+            writer.clear();
+        }
+
+        {
+            // Reuse file name "txt" as extension (and folder name "bar" as file stem).
+
+            // subpaths: [ hash("foo"), hash("foo", "bar"), hash("foo", "bar", "txt") ]
+            // bar: `SubpathFlags::FileOrFolderName`
+            // txt: `SubpathFlags::FileOrFolderName`
+            let txt = writer.insert(filepath!("foo/bar/txt")).unwrap();
+            assert_eq!(writer.len(), 1);
+            assert_eq!(writer.num_components(), 3);
+            assert_eq!(writer.num_subpaths(), 3);
+            assert_eq!(writer.num_extensions(), 0);
+            assert_eq!(writer.string_len(), 9);
+            assert_eq!(writer.lookup(txt).unwrap(), filepath!("foo/bar/txt").into());
+            {
+                let txt = writer.lookup_iter(txt).unwrap();
+                assert_eq!(txt.file_name, FileName::NoExtension(nestr!("txt")));
+                assert!(txt
+                    .file_path
+                    .eq(vec![nestr!("bar"), nestr!("foo")].into_iter()));
+            }
+
+            // bar |= `SubpathFlags::FileStem`
+            // txt |= `SubpathFlags::Extension`
+            let bar_txt = writer.insert(filepath!("foo/bar.txt")).unwrap();
+            assert_eq!(writer.len(), 2);
+            assert_eq!(writer.num_components(), 3);
+            assert_eq!(writer.num_subpaths(), 3);
+            assert_eq!(writer.num_extensions(), 1);
+            assert_eq!(writer.string_len(), 9);
+            assert_eq!(
+                writer.lookup(bar_txt).unwrap(),
+                filepath!("foo/bar.txt").into()
+            );
+            {
+                let bar_txt = writer.lookup_iter(bar_txt).unwrap();
+                assert_eq!(
+                    bar_txt.file_name,
+                    FileName::WithExtension {
+                        extension: nestr!("txt"),
+                        file_stem: Some(nestr!("bar"))
+                    }
+                );
+                assert!(bar_txt.file_path.eq(vec![nestr!("foo")].into_iter()));
+            }
+
+            writer.clear();
+        }
+    }
+
+    #[test]
+    fn reuse_folder_name_as_extension() {
+        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+
+        {
+            // Reuse folder name "bar" as extension (and folder name "foo" as file stem).
+
+            // subpaths: [ hash("foo"), hash("foo", "bar"), hash("foo", "bar", "txt") ]
+            // foo: `SubpathFlags::FileOrFolderName`
+            // bar: `SubpathFlags::FileOrFolderName`
+            let txt = writer.insert(filepath!("foo/bar/txt")).unwrap();
+            assert_eq!(writer.len(), 1);
+            assert_eq!(writer.num_components(), 3);
+            assert_eq!(writer.num_subpaths(), 3);
+            assert_eq!(writer.num_extensions(), 0);
+            assert_eq!(writer.string_len(), 9);
+            assert_eq!(writer.lookup(txt).unwrap(), filepath!("foo/bar/txt").into());
+            {
+                let txt = writer.lookup_iter(txt).unwrap();
+                assert_eq!(txt.file_name, FileName::NoExtension(nestr!("txt")));
+                assert!(txt
+                    .file_path
+                    .eq(vec![nestr!("bar"), nestr!("foo")].into_iter()));
+            }
+
+            // foo |= `SubpathFlags::FileStem`
+            // bar |= `SubpathFlags::Extension`
+            let foo_bar = writer.insert(filepath!("foo.bar")).unwrap();
+            assert_eq!(writer.len(), 2);
+            assert_eq!(writer.num_components(), 3);
+            assert_eq!(writer.num_subpaths(), 3);
+            assert_eq!(writer.num_extensions(), 1);
+            assert_eq!(writer.string_len(), 9);
+            assert_eq!(writer.lookup(foo_bar).unwrap(), filepath!("foo.bar").into());
+            {
+                let mut foo_bar = writer.lookup_iter(foo_bar).unwrap();
+                assert_eq!(
+                    foo_bar.file_name,
+                    FileName::WithExtension {
+                        extension: nestr!("bar"),
+                        file_stem: Some(nestr!("foo"))
+                    }
+                );
+                assert!(foo_bar.file_path.next().is_none());
+            }
+
+            writer.clear();
+        }
+
+        {
+            // Reuse folder name "txt" as extension (and folder name "bar" as file stem).
+
+            // subpaths: [ hash("foo"), hash("foo", "bar"), hash("foo", "bar", "txt"), hash("foo", "bar", "txt", "cfg") ]
+            // bar: `SubpathFlags::FileOrFolderName`
+            // txt: `SubpathFlags::FileOrFolderName`
+            let cfg = writer.insert(filepath!("foo/bar/txt/cfg")).unwrap();
+            assert_eq!(writer.len(), 1);
+            assert_eq!(writer.num_components(), 4);
+            assert_eq!(writer.num_subpaths(), 4);
+            assert_eq!(writer.num_extensions(), 0);
+            assert_eq!(writer.string_len(), 12);
+            assert_eq!(
+                writer.lookup(cfg).unwrap(),
+                filepath!("foo/bar/txt/cfg").into()
+            );
+            {
+                let cfg = writer.lookup_iter(cfg).unwrap();
+                assert_eq!(cfg.file_name, FileName::NoExtension(nestr!("cfg")));
+                assert!(cfg
+                    .file_path
+                    .eq(vec![nestr!("txt"), nestr!("bar"), nestr!("foo")].into_iter()));
+            }
+
+            // bar |= `SubpathFlags::FileStem`
+            // txt |= `SubpathFlags::Extension`
+            let bar_txt = writer.insert(filepath!("foo/bar.txt")).unwrap();
+            assert_eq!(writer.len(), 2);
+            assert_eq!(writer.num_components(), 4);
+            assert_eq!(writer.num_subpaths(), 4);
+            assert_eq!(writer.num_extensions(), 1);
+            assert_eq!(writer.string_len(), 12);
+            assert_eq!(
+                writer.lookup(bar_txt).unwrap(),
+                filepath!("foo/bar.txt").into()
+            );
+            {
+                let bar_txt = writer.lookup_iter(bar_txt).unwrap();
+                assert_eq!(
+                    bar_txt.file_name,
+                    FileName::WithExtension {
+                        extension: nestr!("txt"),
+                        file_stem: Some(nestr!("bar"))
+                    }
+                );
+                assert!(bar_txt.file_path.eq(vec![nestr!("foo")].into_iter()));
+            }
+
+            writer.clear();
+        }
+    }
+
+    #[test]
+    fn reuse_file_stem_as_extension() {
+        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+
+        // Reuse file stem "bar" as extension (and folder name "foo" as file stem).
+
+        // subpaths: [ hash("foo"), hash("foo", "bar"), hash("foo", "bar", "txt") ]
+        // foo: `SubpathFlags::FileOrFolderName`
+        // bar: `SubpathFlags::FileStem`
+        let bar_txt = writer.insert(filepath!("foo/bar.txt")).unwrap();
+        assert_eq!(writer.len(), 1);
+        assert_eq!(writer.num_components(), 2);
+        assert_eq!(writer.num_subpaths(), 3);
+        assert_eq!(writer.num_extensions(), 1);
+        assert_eq!(writer.string_len(), 9);
+        assert_eq!(
+            writer.lookup(bar_txt).unwrap(),
+            filepath!("foo/bar.txt").into()
+        );
+        {
+            let bar_txt = writer.lookup_iter(bar_txt).unwrap();
+            assert_eq!(
+                bar_txt.file_name,
+                FileName::WithExtension {
+                    extension: nestr!("txt"),
+                    file_stem: Some(nestr!("bar"))
+                }
+            );
+            assert!(bar_txt.file_path.eq(vec![nestr!("foo")].into_iter()));
+        }
+
+        // foo |= `SubpathFlags::FileStem`
+        // bar |= `SubpathFlags::Extension`
+        let foo_bar = writer.insert(filepath!("foo.bar")).unwrap();
+        assert_eq!(writer.len(), 2);
+        assert_eq!(writer.num_components(), 2);
+        assert_eq!(writer.num_subpaths(), 3);
+        assert_eq!(writer.num_extensions(), 2);
+        assert_eq!(writer.string_len(), 9);
+        assert_eq!(writer.lookup(foo_bar).unwrap(), filepath!("foo.bar").into());
+        {
+            let mut foo_bar = writer.lookup_iter(foo_bar).unwrap();
+            assert_eq!(
+                foo_bar.file_name,
+                FileName::WithExtension {
+                    extension: nestr!("bar"),
+                    file_stem: Some(nestr!("foo"))
+                }
+            );
+            assert!(foo_bar.file_path.next().is_none());
+        }
+    }
+
+    #[test]
+    fn reuse_extension_as_extension() {
+        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+
+        {
+            // Reuse extension "txt" as extension -> cannot happen, handled earlier by `PathAlreadyExists`
+
+            // subpaths: [ hash("foo"), hash("foo", "bar"), hash("foo", "bar", "txt") ]
+            // bar: `SubpathFlags::FileOrFolderName`
+            let bar_txt = writer.insert(filepath!("foo/bar.txt")).unwrap();
+            assert_eq!(writer.len(), 1);
+            assert_eq!(writer.num_components(), 2);
+            assert_eq!(writer.num_subpaths(), 3);
+            assert_eq!(writer.num_extensions(), 1);
+            assert_eq!(writer.string_len(), 9);
+            assert_eq!(
+                writer.lookup(bar_txt).unwrap(),
+                filepath!("foo/bar.txt").into()
+            );
+            {
+                let bar_txt = writer.lookup_iter(bar_txt).unwrap();
+                assert_eq!(
+                    bar_txt.file_name,
+                    FileName::WithExtension {
+                        extension: nestr!("txt"),
+                        file_stem: Some(nestr!("bar"))
+                    }
+                );
+                assert!(bar_txt.file_path.eq(vec![nestr!("foo")].into_iter()));
+            }
+            assert_eq!(
+                writer.insert(filepath!("foo/bar.txt")).err().unwrap(),
+                FileTreeWriterError::PathAlreadyExists
+            );
+
+            writer.clear();
+        }
+
+        {
+            // Reuse extension "txt" as extension -> cannot happen, handled earlier by `PathAlreadyExists`
+
+            // subpaths: [ hash("foo.bar"), hash("foo.bar", "baz"), hash("foo.bar", "baz", "txt") ]
+            // bar: `SubpathFlags::FileOrFolderName`
+            let baz_txt = writer.insert(filepath!("foo.bar/baz.txt")).unwrap();
+            assert_eq!(writer.len(), 1);
+            assert_eq!(writer.num_components(), 2);
+            assert_eq!(writer.num_subpaths(), 3);
+            assert_eq!(writer.num_extensions(), 1);
+            assert_eq!(writer.string_len(), 13);
+            assert_eq!(
+                writer.lookup(baz_txt).unwrap(),
+                filepath!("foo.bar/baz.txt").into()
+            );
+            {
+                let baz_txt = writer.lookup_iter(baz_txt).unwrap();
+                assert_eq!(
+                    baz_txt.file_name,
+                    FileName::WithExtension {
+                        extension: nestr!("txt"),
+                        file_stem: Some(nestr!("baz"))
+                    }
+                );
+                assert!(baz_txt.file_path.eq(vec![nestr!("foo.bar")].into_iter()));
+            }
+            assert_eq!(
+                writer.insert(filepath!("foo.bar/baz.txt")).err().unwrap(),
+                FileTreeWriterError::PathAlreadyExists
+            );
+
+            writer.clear();
         }
     }
 }
