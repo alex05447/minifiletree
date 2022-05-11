@@ -9,7 +9,7 @@
 //! Path component (and also file name extension) strings are deduplicated, as are the file tree nodes.
 //!
 //! Lookup results may be returned as a (reverse) iterator over the path components (including the extension),
-//! or as a borrowed or owned [`file path`](minifilepath::FilePathBuf).
+//! or as an owned [`file path buffer`](minifilepath::FilePathBuf).
 
 mod data;
 mod error;

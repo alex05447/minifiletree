@@ -4,6 +4,7 @@ use {
         collections::{hash_map::Entry, HashMap},
         hash::Hash,
         io::Write,
+        iter::Iterator,
         mem, slice,
     },
 };
@@ -119,6 +120,11 @@ impl<K: Eq + Hash, V: Eq + Copy> MultiMap<K, V> {
         })
     }
 
+    /// Returns an iterator over entries in the multimap associated with `key` in unspecified order.
+    pub(crate) fn get_iter(&self, key: &K) -> impl Iterator<Item = &V> {
+        MultiMapIter(self.get(&key).map(<[V]>::iter))
+    }
+
     pub(crate) fn get_mut(&mut self, key: &K) -> Option<&mut [V]> {
         self.0.get_mut(&key).map(|entry| match entry {
             OneOrMultiple::One(value) => slice::from_mut(value),
@@ -126,16 +132,45 @@ impl<K: Eq + Hash, V: Eq + Copy> MultiMap<K, V> {
         })
     }
 
+    /// Returns an iterator over entries in the multimap associated with `key` in unspecified order.
+    pub(crate) fn get_iter_mut(&mut self, key: &K) -> impl Iterator<Item = &mut V> {
+        MultiMapIterMut(self.get_mut(&key).map(<[V]>::iter_mut))
+    }
+
     pub(crate) fn clear(&mut self) {
         self.0.clear()
     }
 
+    /// Returns an iterator over all entries in the multimap in unspecified order.
     #[cfg(test)]
-    pub(crate) fn iter(&self) -> impl std::iter::Iterator<Item = &[V]> {
-        self.0.iter().map(|(_, v)| match v {
-            OneOrMultiple::One(value) => slice::from_ref(value),
-            OneOrMultiple::Multiple(values) => values,
-        })
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &V> {
+        self.0
+            .iter()
+            .map(|(_, v)| match v {
+                OneOrMultiple::One(value) => slice::from_ref(value),
+                OneOrMultiple::Multiple(values) => values,
+            })
+            .flat_map(<[V]>::iter)
+    }
+}
+
+struct MultiMapIter<'a, V>(Option<slice::Iter<'a, V>>);
+
+impl<'a, V> Iterator for MultiMapIter<'a, V> {
+    type Item = &'a V;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.as_mut().map(slice::Iter::next).flatten()
+    }
+}
+
+struct MultiMapIterMut<'a, V>(Option<slice::IterMut<'a, V>>);
+
+impl<'a, V> Iterator for MultiMapIterMut<'a, V> {
+    type Item = &'a mut V;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.as_mut().map(slice::IterMut::next).flatten()
     }
 }
 

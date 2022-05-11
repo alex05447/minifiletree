@@ -201,7 +201,7 @@ where
 
         // Explicitly handle file names with extensions which match folder names of the same form.
         //
-        // E.g. we want to error out when inserting "foo/bar.txt/baz" (folder name "bar.txt"),
+        // E.g. we want to error out when first inserting "foo/bar.txt/baz" (folder name "bar.txt"),
         // then "foo/bar.txt" (file name "bar.txt").
         // Otherwise, code below will not match folder name "foo" followed by file stem "bar"
         // and will insert a new component and continue instead of returning an error.
@@ -211,8 +211,8 @@ where
         // Also see `folder_name_as_file_stem_and_extension_rev_iter()`.
         let mut subpath_hasher = self.hash_builder.build_hasher();
 
-        for path_component_or_extension in path_component_and_extension_iter(path, num_components) {
-            match path_component_or_extension {
+        for path_component in path_component_and_extension_iter(path, num_components) {
+            match path_component {
                 PathComponentKind::Folder(folder_name) => {
                     subpath_hasher.write(folder_name.as_bytes());
                 }
@@ -226,20 +226,20 @@ where
                     subpath_hasher.write(extension.as_bytes());
                     let subpath_hash = subpath_hasher.finish();
 
-                    if let Some(folder_spcs) = self
+                    for folder_spc in self
                         .subpath_lookup
-                        .get(&subpath_hash)
-                        .map(|spcs| spcs.iter().filter(|spc| spc.is_folder_name()))
+                        .get_iter(&subpath_hash)
+                        .cloned()
+                        // Only look for folder name subpaths.
+                        .filter(SubpathComponent::is_folder_name)
                     {
-                        for folder_spc in folder_spcs {
-                            if self
-                                .folder_name_as_file_stem_and_extension_rev_iter(
-                                    folder_spc.path_component_or_file_stem_index,
-                                )
-                                .eq(file_path_rev_iter(path))
-                            {
-                                return Err(FolderAlreadyExistsAtFilePath);
-                            }
+                        if self
+                            .folder_name_as_file_stem_and_extension_rev_iter(
+                                folder_spc.path_component_or_file_stem_index,
+                            )
+                            .eq(file_path_rev_iter(path))
+                        {
+                            return Err(FolderAlreadyExistsAtFilePath);
                         }
                     }
                 }
@@ -325,7 +325,7 @@ where
                     PathComponentKind::FileName(_) => {
                         // Reused the (folder name, file stem or extension) subpath as the file name.
 
-                        // Check if we reused a folder name as the file name, which is an error.
+                        // First check if we reused a folder name as the file name, which is an error.
                         // E.g. reusing folder name "bar" in "foo/bar/baz.txt" as a file name in "foo/bar".
                         if subpath.is_folder_name() {
                             // Can use `subpath_hash` in `path_lookup` because the path has no extension.
@@ -366,9 +366,9 @@ where
                         }
                     }
                     PathComponentKind::Folder(_) => {
-                        // Reused the (any) subpath as folder name.
+                        // Reused (any) subpath as folder name.
 
-                        // Check if we reused a file name as a folder name, which is an error.
+                        // First check if we reused a file name as a folder name, which is an error.
                         // E.g. reusing file name "bar" in "foo/bar" as a folder name in "foo/bar/baz.txt".
                         if subpath.is_file_name() {
                             let index = subpath.path_component_or_file_stem_index;
@@ -583,6 +583,7 @@ where
         // Path lookup.
 
         // Get and sort the path hashes.
+        // NOTE - sorting is relied upon for binary search in `FileTreeReader::lookup_leaf_path_component()`.
         let mut path_hashes = self.path_lookup.keys().cloned().collect::<Vec<_>>();
         path_hashes.sort();
 
@@ -594,26 +595,24 @@ where
         debug_assert!(written % 8 == 0, "should be aligned to 8 bytes");
 
         // Write the leaf path components.
-        for leaf_path_component in path_hashes
+        for lpc in path_hashes
             .iter()
             // Must succeed - all keys are contained in the map.
             .map(|path_hash| *unsafe { debug_unwrap(self.path_lookup.get(path_hash)) })
         {
-            written += leaf_path_component.write(w)?;
+            written += lpc.write(w)?;
         }
 
         debug_assert!(written % 8 == 0, "should be aligned to 8 bytes");
 
-        // Path components array.
-
+        // Write the path components array.
         for path_component in self.path_components {
             written += path_component.write(w)?;
         }
 
         debug_assert!(written % 8 == 0, "should be aligned to 8 bytes");
 
-        // Extension table.
-
+        // Write the extension table.
         for extension in self.extension_table {
             written += write_u32(w, extension)?;
         }
@@ -627,20 +626,18 @@ where
 
         debug_assert!(written % 8 == 0, "should be aligned to 8 bytes");
 
-        // String table.
-
+        // Write the string table.
         // Patch up the string offsets to be relative to the start of the blob.
         let string_offset =
             (written + self.string_table.len() * size_of::<PackedInternedString>()) as StringOffset;
 
-        for offset_and_length in self.string_table.iter() {
-            written += offset_and_length.write(w, string_offset)?;
+        for string in self.string_table.iter() {
+            written += string.write(w, string_offset)?;
         }
 
         debug_assert!(written % 8 == 0, "should be aligned to 8 bytes");
 
-        // Strings.
-
+        // Write the strings.
         w.write_all(self.strings.as_bytes())?;
         written += self.strings.len();
 
@@ -684,7 +681,7 @@ where
 
     #[cfg(test)]
     fn num_subpaths(&self) -> usize {
-        self.subpath_lookup.iter().fold(0, |num, v| num + v.len())
+        self.subpath_lookup.iter().count()
     }
 
     /// Clears the writer, resetting all internal data structures without deallocating any storage.
@@ -829,29 +826,21 @@ where
         parent_index: Option<PathComponentIndex>,
     ) -> Option<SubpathComponent> {
         if let PathComponentKind::Folder(folder_name) = path_component {
-            file_stem_and_extension(folder_name)
-                .and_then(
-                    |FileStemAndExtension {
-                         file_stem,
-                         extension,
-                     }| {
-                        // Hash the folder name as if it were a file name with an extension (i.e. skip the dot. See `SubpathLookup`).
-                        folder_name_hasher.write(file_stem_str(&file_stem).as_bytes());
-                        folder_name_hasher.write(extension.as_bytes());
-                        let folder_name_hash = folder_name_hasher.finish();
+            file_stem_and_extension(folder_name).and_then(
+                |FileStemAndExtension {
+                     file_stem,
+                     extension,
+                 }| {
+                    // Hash the folder name as if it were a file name with an extension (i.e. skip the dot. See `SubpathLookup`).
+                    folder_name_hasher.write(file_stem_str(&file_stem).as_bytes());
+                    folder_name_hasher.write(extension.as_bytes());
+                    let folder_name_hash = folder_name_hasher.finish();
 
-                        // Look only for subpaths for an extension.
-                        self.subpath_lookup.get(&folder_name_hash).map(|spcs| {
-                            (
-                                file_stem,
-                                extension,
-                                spcs.iter().filter(|spc| spc.is_extension()),
-                            )
-                        })
-                    },
-                )
-                .and_then(|(file_stem, extension, mut extension_spcs)| {
-                    extension_spcs
+                    self.subpath_lookup
+                        .get_iter(&folder_name_hash)
+                        .cloned()
+                        // Only look for extension subpaths.
+                        .filter(SubpathComponent::is_extension)
                         .find(|extension_spc| {
                             let exising_subpath = Self::string_rev_iter(
                                 &self.path_components,
@@ -874,8 +863,8 @@ where
 
                             new_subpath.eq(exising_subpath)
                         })
-                        .map(|extension_spc| *extension_spc)
-                })
+                },
+            )
         } else {
             None
         }
@@ -919,27 +908,25 @@ where
         path_component: &str,
         parent_index: Option<PathComponentIndex>,
     ) -> Option<&'a mut SubpathComponent> {
-        subpath_lookup.get_mut(&subpath_hash).and_then(|spcs| {
-            spcs.iter_mut().find(|spc| {
-                let existing_subpath = Self::string_rev_iter(
-                    path_components,
-                    extension_table,
-                    string_table,
-                    strings,
-                    spc.path_component_or_file_stem_index,
-                    spc.extension_index,
-                );
-                let new_subpath = iter::once(path_component).chain(StringIter::new(
-                    path_components,
-                    extension_table,
-                    string_table,
-                    strings,
-                    parent_index,
-                    None,
-                ));
+        subpath_lookup.get_iter_mut(&subpath_hash).find(|spc| {
+            let existing_subpath = Self::string_rev_iter(
+                path_components,
+                extension_table,
+                string_table,
+                strings,
+                spc.path_component_or_file_stem_index,
+                spc.extension_index,
+            );
+            let new_subpath = iter::once(path_component).chain(StringIter::new(
+                path_components,
+                extension_table,
+                string_table,
+                strings,
+                parent_index,
+                None,
+            ));
 
-                new_subpath.eq(existing_subpath)
-            })
+            new_subpath.eq(existing_subpath)
         })
     }
 
@@ -996,31 +983,34 @@ where
             hasher.finish()
         };
 
-        extension_lookup
-            .get(&extension_hash)
-            .and_then(|extension_indices| {
-                extension_indices.iter().find(|&&extension_index| {
-                    get_string(
-                        string_table,
-                        strings,
-                        get_extension(extension_table, extension_index),
-                    ) == extension.as_str()
-                })
-            })
-            .map(|extension_index| *extension_index)
-            .unwrap_or_else(|| {
-                let extension_string_index = Self::string_index_with_hash(
-                    string_lookup,
+        if let Some(extension_index) = extension_lookup
+            // First lookup by string hash.
+            .get_iter(&extension_hash)
+            // Then compare the strings.
+            .find(|&&extension_index| {
+                get_string(
                     string_table,
                     strings,
-                    extension.as_str(),
-                    extension_hash,
-                );
-                let extension_index = extension_table.len() as ExtensionIndex;
-                extension_table.push(extension_string_index);
-                extension_lookup.insert(extension_hash, extension_index);
-                extension_index
+                    get_extension(extension_table, extension_index),
+                ) == extension.as_str()
             })
+        {
+            // If the extension already exists - return its index.
+            return *extension_index;
+        }
+
+        // Else the extension does not exist - intern its string, add it and return its index.
+        let extension_string_index = Self::string_index_with_hash(
+            string_lookup,
+            string_table,
+            strings,
+            extension.as_str(),
+            extension_hash,
+        );
+        let extension_index = extension_table.len() as ExtensionIndex;
+        extension_table.push(extension_string_index);
+        extension_lookup.insert(extension_hash, extension_index);
+        extension_index
     }
 
     /// Used for error reporting.
@@ -1076,21 +1066,18 @@ where
         string: &str,
         hash: PathHash,
     ) -> StringIndex {
-        string_lookup
+        if let Some(string_index) = string_lookup
             // First lookup by string hash.
-            .get(&hash)
+            .get_iter(&hash)
             // Then compare the strings.
-            .and_then(|string_indices| {
-                string_indices
-                    .iter()
-                    .cloned()
-                    // If the `string` already exists - return its index.
-                    .find(|&string_index| get_string(string_table, strings, string_index) == string)
-            })
-            // Else the string does not exist - intern it and return its index.
-            .unwrap_or_else(|| {
-                Self::intern_string(string_lookup, string_table, strings, string, hash)
-            })
+            .find(|&&string_index| get_string(string_table, strings, string_index) == string)
+        {
+            // If the `string` already exists - return its index.
+            return *string_index;
+        }
+
+        // Else the string does not exist - intern it and return its index.
+        Self::intern_string(string_lookup, string_table, strings, string, hash)
     }
 
     /// Adds the unique `string` with `hash` to the lookup data structures and returns its index.
@@ -1126,9 +1113,9 @@ fn get_path_component(
 }
 
 /// The caller guarantees the extension `index` is valid.
-fn get_extension(extensions: &[StringIndex], index: ExtensionIndex) -> StringIndex {
-    debug_assert!((index as usize) < extensions.len());
-    *unsafe { extensions.get_unchecked(index as usize) }
+fn get_extension(extension_table: &[StringIndex], index: ExtensionIndex) -> StringIndex {
+    debug_assert!((index as usize) < extension_table.len());
+    *unsafe { extension_table.get_unchecked(index as usize) }
 }
 
 /// The caller guarantees the string `index` is valid.

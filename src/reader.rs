@@ -98,7 +98,7 @@ impl<'a> FileTreeReader<'a> {
     pub fn string_len(&self) -> u64 {
         let header = unsafe { Self::header(self.data) };
 
-        let string_section_start = Self::string_section_start(
+        let string_section_start = Self::string_section_offset(
             header.lookup_len(),
             header.path_components_len(),
             header.extension_table_len(),
@@ -236,7 +236,9 @@ impl<'a> FileTreeReader<'a> {
         // Make sure all extension string indices are within the valid range.
         if extension_table
             .iter()
-            .any(|&extension| extension >= string_table_len)
+            .cloned()
+            .map(u32_from_bin)
+            .any(|extension| extension >= string_table_len)
         {
             return false;
         }
@@ -269,7 +271,7 @@ impl<'a> FileTreeReader<'a> {
                 }
         */
 
-        let string_section_start = Self::string_section_start(
+        let string_section_start = Self::string_section_offset(
             lookup_len,
             path_components_len,
             extension_table_len,
@@ -437,12 +439,9 @@ impl<'a> FileTreeReader<'a> {
 
             let path_hashes = unsafe { Self::path_hashes(self.data, lookup_len) };
 
-            if let Some(idx) = path_hashes
-                .iter()
-                .cloned()
-                .map(u64_from_bin)
-                // TODO: binary search.
-                .position(|key| key == hash)
+            // Binary search the lookup key slice (requires sorting by path hash in `FileTreeWriter::write()`, which we do).
+            if let Ok(idx) =
+                path_hashes.binary_search_by(|&path_hash| u64_from_bin(path_hash).cmp(&hash))
             {
                 let lpcs = unsafe { Self::leaf_path_components(self.data, lookup_len) };
                 debug_assert!(idx < lpcs.len());
@@ -571,7 +570,7 @@ impl<'a> FileTreeReader<'a> {
             )
         };
         debug_assert!((index as usize) < extension_table.len());
-        *unsafe { extension_table.get_unchecked(index as usize) }
+        u32_from_bin(*unsafe { extension_table.get_unchecked(index as usize) })
     }
 
     /// Calculates the offset in bytes from the start of the file tree data blob to the array of path hashes / lookup keys.
@@ -710,6 +709,20 @@ impl<'a> FileTreeReader<'a> {
         )
     }
 
+    /// Calculates the offset in bytes to the (variable length) string section for given section lengths from the header.
+    const fn string_section_offset(
+        lookup_len: PathComponentIndex,
+        path_components_len: PathComponentIndex,
+        extension_table_len: ExtensionIndex,
+        string_table_len: StringIndex,
+    ) -> StringOffset {
+        // |Header|Path hashes|Leaf path components|Path components|Extension table|String table|Strings|
+        //                                                                                      ^
+        //                                                                                      |
+        Self::string_table_offset(lookup_len, path_components_len, extension_table_len)
+            + Self::string_table_size(string_table_len)
+    }
+
     /// Minimum size of the (variable length) string section given the string table length. Assumes 1-byte strings.
     const fn min_string_section_size(string_table_len: StringIndex) -> u64 {
         1 * string_table_len as u64
@@ -717,38 +730,23 @@ impl<'a> FileTreeReader<'a> {
 
     /// Minimum size of the valid file tree data blob.
     /// Header, 1 lookup entry, 1 path component entry, 0 extension entries, 1 string table entry, 1-byte string.
-    fn min_size() -> u64 {
+    const fn min_size() -> u64 {
         Self::required_size(1, 1, 0, 1)
     }
 
     /// Calculates the required minimum data blob size in bytes for given section lengths from the header.
-    fn required_size(
+    const fn required_size(
         lookup_len: PathComponentIndex,
         path_components_len: PathComponentIndex,
         extension_table_len: ExtensionIndex,
         string_table_len: StringIndex,
     ) -> u64 {
-        Self::string_section_start(
+        Self::string_section_offset(
             lookup_len,
             path_components_len,
             extension_table_len,
             string_table_len,
         ) + Self::min_string_section_size(string_table_len)
-    }
-
-    /// Calculates the offset in bytes to the (variable length) string section for given section lengths from the header.
-    fn string_section_start(
-        lookup_len: PathComponentIndex,
-        path_components_len: PathComponentIndex,
-        extension_table_len: ExtensionIndex,
-        string_table_len: StringIndex,
-    ) -> StringOffset {
-        (mem::size_of::<FileTreeHeader>() as StringOffset)
-            + Self::path_hashes_size(lookup_len)
-            + Self::leaf_path_components_size(lookup_len)
-            + Self::path_components_size(path_components_len)
-            + Self::extension_table_size(extension_table_len)
-            + Self::string_table_size(string_table_len)
     }
 
     /*
