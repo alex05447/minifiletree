@@ -4,6 +4,7 @@ use {
     crate::*,
     bitflags::*,
     minifilepath::*,
+    minimultimap::*,
     ministr::*,
     std::{
         collections::HashMap,
@@ -682,7 +683,7 @@ where
 
     #[cfg(test)]
     fn num_subpaths(&self) -> usize {
-        self.subpath_lookup.iter().count()
+        self.subpath_lookup.values().count()
     }
 
     /// Clears the writer, resetting all internal data structures without deallocating any storage.

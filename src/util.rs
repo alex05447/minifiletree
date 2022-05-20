@@ -1,12 +1,6 @@
 use {
     crate::*,
-    std::{
-        collections::{hash_map::Entry, HashMap},
-        hash::Hash,
-        io::Write,
-        iter::Iterator,
-        mem, slice,
-    },
+    std::{io::Write, iter::Iterator, mem},
 };
 
 pub(crate) fn u16_to_bin_bytes(val: u16) -> [u8; 2] {
@@ -71,107 +65,6 @@ pub(crate) fn write_u32<W: Write>(w: &mut W, val: u32) -> Result<usize, std::io:
 
 pub(crate) fn write_u16<W: Write>(w: &mut W, val: u16) -> Result<usize, std::io::Error> {
     write_all(w, &u16_to_bin_bytes(val))
-}
-
-/// One or multiple values in the multimap associated with a given key.
-enum OneOrMultiple<T> {
-    /// Usual case - one value associated with a key.
-    One(T),
-    /// Rare hash collision case - multiple values associated with a key.
-    Multiple(Vec<T>),
-}
-
-/// A simple multimap optimized for the usual case of 1 value per key with no overhead,
-/// but which does support multiple values by storing them in a `Vec` when necessary.
-/// Only supports `insert()` and `get()` methods.
-pub(crate) struct MultiMap<K: Eq + Hash, V: Eq + Copy>(HashMap<K, OneOrMultiple<V>>);
-
-impl<K: Eq + Hash, V: Eq + Copy> MultiMap<K, V> {
-    pub(crate) fn new() -> Self {
-        Self(HashMap::new())
-    }
-
-    /// The caller guarantees that `value` is not associated with `key`.
-    pub(crate) fn insert(&mut self, key: K, value: V) {
-        match self.0.entry(key) {
-            Entry::Occupied(mut entry) => {
-                let entry = entry.get_mut();
-                match entry {
-                    OneOrMultiple::One(existing) => {
-                        debug_assert!(*existing != value);
-                        *entry = OneOrMultiple::Multiple(vec![*existing, value]);
-                    }
-                    OneOrMultiple::Multiple(existing) => {
-                        debug_assert!(!existing.contains(&value));
-                        existing.push(value);
-                    }
-                }
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(OneOrMultiple::One(value));
-            }
-        }
-    }
-
-    pub(crate) fn get(&self, key: &K) -> Option<&[V]> {
-        self.0.get(&key).map(|entry| match entry {
-            OneOrMultiple::One(value) => slice::from_ref(value),
-            OneOrMultiple::Multiple(values) => values,
-        })
-    }
-
-    /// Returns an iterator over entries in the multimap associated with `key` in unspecified order.
-    pub(crate) fn get_iter(&self, key: &K) -> impl Iterator<Item = &V> {
-        MultiMapIter(self.get(&key).map(<[V]>::iter))
-    }
-
-    pub(crate) fn get_mut(&mut self, key: &K) -> Option<&mut [V]> {
-        self.0.get_mut(&key).map(|entry| match entry {
-            OneOrMultiple::One(value) => slice::from_mut(value),
-            OneOrMultiple::Multiple(values) => values,
-        })
-    }
-
-    /// Returns an iterator over entries in the multimap associated with `key` in unspecified order.
-    pub(crate) fn get_iter_mut(&mut self, key: &K) -> impl Iterator<Item = &mut V> {
-        MultiMapIterMut(self.get_mut(&key).map(<[V]>::iter_mut))
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.0.clear()
-    }
-
-    /// Returns an iterator over all entries in the multimap in unspecified order.
-    #[cfg(test)]
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &V> {
-        self.0
-            .iter()
-            .map(|(_, v)| match v {
-                OneOrMultiple::One(value) => slice::from_ref(value),
-                OneOrMultiple::Multiple(values) => values,
-            })
-            .flat_map(<[V]>::iter)
-    }
-}
-
-struct MultiMapIter<'a, V>(Option<slice::Iter<'a, V>>);
-
-impl<'a, V> Iterator for MultiMapIter<'a, V> {
-    type Item = &'a V;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.0.as_mut().map(slice::Iter::next).flatten()
-    }
-}
-
-struct MultiMapIterMut<'a, V>(Option<slice::IterMut<'a, V>>);
-
-impl<'a, V> Iterator for MultiMapIterMut<'a, V> {
-    type Item = &'a mut V;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.0.as_mut().map(slice::IterMut::next).flatten()
-    }
 }
 
 /// Takes a file path iterator and known full path string length `len`,
