@@ -78,7 +78,7 @@ impl<'a> FileTreeReader<'a> {
         header.version()
     }
 
-    /// Returns the number of [`file paths`](FilePath) in the reader.
+    /// Returns the number of [`file paths`](minifilepath::FilePath) in the reader.
     pub fn len(&self) -> usize {
         let header = unsafe { Self::header(self.data) };
 

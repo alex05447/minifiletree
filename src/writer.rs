@@ -621,6 +621,7 @@ where
         let mut to_write = written % 8;
         while to_write > 0 {
             w.write_all(&[b'0'])?;
+            written += 1;
             to_write -= 1;
         }
 
