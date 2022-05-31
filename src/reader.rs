@@ -10,24 +10,24 @@ use {
 };
 
 /// Provides an API to lookup [`file paths`](FilePathBuf) by their [`hashes`](PathHash)
-/// in the data blob [`written`](FileTreeWriter::write) by the [`FileTreeWriter`].
-pub struct FileTreeReader<'a> {
+/// in the data blob [`written`](Writer::write) by the [`Writer`].
+pub struct Reader<'a> {
     data: &'a [u8],
     lookup: Option<HashMap<PathHash, LeafPathComponent>>,
 }
 
-impl<'a> FileTreeReader<'a> {
-    /// Creates a [`FileTreeReader`] from the `data` blob [`written`](FileTreeWriter#method.write) by the [`FileTreeWriter`].
-    /// Attempts to validate the `data` blob and returns `None` if `data` is not a valid file tree data blob.
-    pub fn new(data: &'a [u8]) -> Option<Self> {
-        if !Self::validate_blob(&data) {
-            return None;
-        }
+impl<'a> Reader<'a> {
+    /// Creates a [`Reader`] from the `data` blob [`written`](Writer#method.write) by the [`Writer`].
+    /// Attempts to validate the `data` blob and returns an [`error`](ReaderError) if `data` is not a valid file tree data blob.
+    /// If `expected_version` is `Some`, checks if the file tree header's user-provided version value matches `expected_version`,
+    /// and returns an [`error`](ReaderError::UnexpectedVersion) if it doesn't.
+    pub fn new(data: &'a [u8], expected_version: Option<Version>) -> Result<Self, ReaderError> {
+        Self::validate_blob(&data, expected_version)?;
 
-        Some(Self { data, lookup: None })
+        Ok(Self { data, lookup: None })
     }
 
-    /// Creates a [`FileTreeReader`] from the `data` blob [`written`](struct.FileTreeWriter.html#method.write) by the [`FileTreeWriter`].
+    /// Creates a [`Reader`] from the `data` blob [`written`](struct.Writer.html#method.write) by the [`Writer`].
     ///
     /// # Safety
     ///
@@ -36,19 +36,19 @@ impl<'a> FileTreeReader<'a> {
     pub unsafe fn new_unchecked(data: &'a [u8]) -> Self {
         // TODO: still doing a sanity check in debug configuration just in case. Remove if/when this becomes an issue.
         debug_assert!(
-            Self::validate_blob(data),
-            "tried to create a `FileTreeReader` from an invalid data blob"
+            Self::validate_blob(data, None).is_ok(),
+            "tried to create a `Reader` from an invalid data blob"
         );
         Self { data, lookup: None }
     }
 
-    /// Returns `true` if `data` is a valid file tree data blob, [`written`](struct.FileTreeWriter.html#method.write) by the [`FileTreeWriter`].
+    /// Returns `true` if `data` is a valid file tree data blob, [`written`](struct.Writer.html#method.write) by the [`Writer`].
     pub fn is_valid(data: &'a [u8]) -> bool {
-        Self::validate_blob(data)
+        Self::validate_blob(data, None).is_ok()
     }
 
     /// (Optionally) builds the hashmap to accelerate lookups.
-    /// Call once after creating the [`FileTreeReader`].
+    /// Call once after creating the [`Reader`].
     ///
     /// Provides `O(1)` lookups at the cost of extra memory.
     /// Otherwise lookups are `O(n)`.
@@ -71,8 +71,8 @@ impl<'a> FileTreeReader<'a> {
         }
     }
 
-    /// Returns the user-provided "version" from the header, as written by [`FileTreeWriter::write`] / [`FileTreeWriter::write_to_vec`].
-    pub fn version(&self) -> u64 {
+    /// Returns the user-provided "version" from the header, as written by [`Writer::write`] / [`Writer::write_to_vec`].
+    pub fn version(&self) -> Version {
         let header = unsafe { Self::header(self.data) };
 
         header.version()
@@ -145,16 +145,18 @@ impl<'a> FileTreeReader<'a> {
         self.lookup_into(hash, FilePathBuilder::new()).ok()
     }
 
-    /// The caller guarantees the `data` is at least large enough to hold a `FileTreeHeader`.
-    unsafe fn header(data: &[u8]) -> &FileTreeHeader {
+    /// The caller guarantees the `data` is at least large enough to hold a [`Header`].
+    unsafe fn header(data: &[u8]) -> &Header {
         &*(data.as_ptr() as *const _)
     }
 
-    // Attempts to validate the `data` to make sure it is a valid file tree blob, written by the `FileTreeWriter`.
-    fn validate_blob(data: &[u8]) -> bool {
+    // Attempts to validate the `data` to make sure it is a valid file tree blob, written by the [`Writer`].
+    fn validate_blob(data: &[u8], expected_version: Option<Version>) -> Result<(), ReaderError> {
+        use ReaderError::*;
+
         // Check if the data is at least large enough to hold the smallest possible file tree blob.
         if (data.len() as u64) < Self::min_size() {
-            return false;
+            return Err(InvalidData);
         }
 
         // Safe because we made sure the `data` is large enough for at least a header.
@@ -162,7 +164,14 @@ impl<'a> FileTreeReader<'a> {
 
         // Check the header magic.
         if !header.check_magic() {
-            return false;
+            return Err(InvalidData);
+        }
+
+        if let Some(expected_version) = expected_version {
+            let version = header.version();
+            if version != expected_version {
+                return Err(UnexpectedVersion(version));
+            }
         }
 
         let lookup_len = header.lookup_len();
@@ -172,17 +181,17 @@ impl<'a> FileTreeReader<'a> {
 
         // Must have at least as many (or more) path components as there are leaf path components.
         if path_components_len < lookup_len {
-            return false;
+            return Err(InvalidData);
         }
 
         // Must have as many (or more) leaf path components as there are extensions.
         if lookup_len < extension_table_len as _ {
-            return false;
+            return Err(InvalidData);
         }
 
         // Must have at least as many (or more) path components as there are strings.
         if path_components_len < string_table_len {
-            return false;
+            return Err(InvalidData);
         }
 
         // Must be large enough to accomodate the section lengths from the header.
@@ -194,7 +203,7 @@ impl<'a> FileTreeReader<'a> {
                 string_table_len,
             )
         {
-            return false;
+            return Err(InvalidData);
         }
 
         /*
@@ -204,7 +213,7 @@ impl<'a> FileTreeReader<'a> {
                 // All entries must be unique.
                 #[cfg(debug_assertions)]
                 if Self::has_duplicates_quadratic(lookup_keys) {
-                    return false;
+                    return Err(InvalidData);
                 }
         */
 
@@ -216,13 +225,13 @@ impl<'a> FileTreeReader<'a> {
         for path_component in path_components.iter().map(PackedPathComponent::unpack) {
             // Make sure all string indices are within the valid range.
             if path_component.string >= string_table_len {
-                return false;
+                return Err(InvalidData);
             }
 
             // Make sure all parent indices are within the valid range.
             if let Some(parent) = path_component.parent {
                 if parent >= path_components_len {
-                    return false;
+                    return Err(InvalidData);
                 }
             }
         }
@@ -240,14 +249,14 @@ impl<'a> FileTreeReader<'a> {
             .map(u32_from_bin)
             .any(|extension| extension >= string_table_len)
         {
-            return false;
+            return Err(InvalidData);
         }
 
         /*
             // All entries must be unique.
             #[cfg(debug_assertions)]
             if Self::has_duplicates_quadratic(extension_table) {
-                return false;
+                return Err(InvalidData);
             }
         */
 
@@ -267,7 +276,7 @@ impl<'a> FileTreeReader<'a> {
                 // All entries must be unique.
                 #[cfg(debug_assertions)]
                 if Self::has_duplicates_quadratic(string_table) {
-                    return false;
+                    return Err(InvalidData);
                 }
         */
 
@@ -285,16 +294,16 @@ impl<'a> FileTreeReader<'a> {
             // Empty strings are allowed (empty file stems), and must have offset == `0`.
             if string.len == 0 {
                 if string.offset != 0 {
-                    return false;
+                    return Err(InvalidData);
                 }
             } else {
                 // Make sure all string offsets and lengths in the string table are within the valid range.
                 if string.offset < string_section_start as _ {
-                    return false;
+                    return Err(InvalidData);
                 }
 
                 if string.offset + string.len as StringOffset > string_section_end {
-                    return false;
+                    return Err(InvalidData);
                 }
             }
 
@@ -305,11 +314,11 @@ impl<'a> FileTreeReader<'a> {
                 if let Some(string) = NonEmptyStr::new(string) {
                     // Make sure all strings are valid path components.
                     if !is_valid_path_component(string) {
-                        return false;
+                        return Err(InvalidData);
                     }
                 }
             } else {
-                return false;
+                return Err(InvalidData);
             }
         }
 
@@ -321,7 +330,7 @@ impl<'a> FileTreeReader<'a> {
                 // All entries must be unique.
                 #[cfg(debug_assertions)]
                 if Self::has_duplicates_quadratic(lpcs) {
-                    return false;
+                    return Err(InvalidData);
                 }
         */
 
@@ -333,18 +342,18 @@ impl<'a> FileTreeReader<'a> {
         for lpc in lpcs.iter().map(PackedLeafPathComponent::unpack) {
             // Make sure all path component indices are within the valid range.
             if lpc.path_component >= path_components_len {
-                return false;
+                return Err(InvalidData);
             }
 
             // Make sure all extension indices are within the valid range.
             if let Some(extension) = lpc.extension {
                 if extension > extension_table_len {
-                    return false;
+                    return Err(InvalidData);
                 }
             }
 
             if (lpc.string_len as StringOffset) > string_section_len {
-                return false;
+                return Err(InvalidData);
             }
 
             // Check for cycles starting at this leaf path component.
@@ -400,7 +409,7 @@ impl<'a> FileTreeReader<'a> {
                     if let Some(parent) = path_component.parent {
                         // Cycles are not allowed.
                         if !visited_components.insert(parent) {
-                            return false;
+                            return Err(InvalidData);
                         }
 
                         cur_path_component = parent;
@@ -414,22 +423,22 @@ impl<'a> FileTreeReader<'a> {
                 }
 
                 if actual_len != lpc.string_len {
-                    return false;
+                    return Err(InvalidData);
                 }
             }
         }
 
         // Seems like all the offsets/lengths/indices in the blob are within valid ranges;
         // and all strings are valid UTF-8.
-        // This at least guarantees all accesses to the data blob via the `FileTreeReader` will be memory-safe.
+        // This at least guarantees all accesses to the data blob via the `Reader` will be memory-safe.
 
-        true
+        Ok(())
     }
 
     /// Looks up the leaf path component associated with the file path `hash`, if any.
     fn lookup_leaf_path_component(
         &self,
-        header: &FileTreeHeader,
+        header: &Header,
         hash: PathHash,
     ) -> Option<LeafPathComponent> {
         if let Some(lookup) = &self.lookup {
@@ -439,7 +448,7 @@ impl<'a> FileTreeReader<'a> {
 
             let path_hashes = unsafe { Self::path_hashes(self.data, lookup_len) };
 
-            // Binary search the lookup key slice (requires sorting by path hash in `FileTreeWriter::write()`, which we do).
+            // Binary search the lookup key slice (requires sorting by path hash in `Writer::write()`, which we do).
             if let Ok(idx) =
                 path_hashes.binary_search_by(|&path_hash| u64_from_bin(path_hash).cmp(&hash))
             {
@@ -455,7 +464,7 @@ impl<'a> FileTreeReader<'a> {
     /// Clears and fills the `builder` with the full path for the leaf path component `lpc`, using `/` as separators.
     fn build_path_string(
         &self,
-        header: &FileTreeHeader,
+        header: &Header,
         lpc: LeafPathComponent,
         builder: FilePathBuilder,
     ) -> FilePathBuf {
@@ -469,7 +478,7 @@ impl<'a> FileTreeReader<'a> {
     /// The caller guarantees `lpc` is valid.
     fn iter(
         &self,
-        header: &FileTreeHeader,
+        header: &Header,
         lpc: LeafPathComponent,
     ) -> FilePathIter<'_, impl Iterator<Item = FilePathComponent<'_>>> {
         let path_component = self.path_component_impl(header, lpc.path_component);
@@ -508,11 +517,7 @@ impl<'a> FileTreeReader<'a> {
     }
 
     /// The caller guarantees the path component `index` is valid.
-    fn path_component_impl(
-        &self,
-        header: &FileTreeHeader,
-        index: PathComponentIndex,
-    ) -> PathComponent {
+    fn path_component_impl(&self, header: &Header, index: PathComponentIndex) -> PathComponent {
         let path_components = unsafe {
             Self::path_components(self.data, header.lookup_len(), header.path_components_len())
         };
@@ -558,7 +563,7 @@ impl<'a> FileTreeReader<'a> {
     /// The caller guarantees the extension `index` is valid,
     fn extension_string_index_impl(
         data: &[u8],
-        header: &FileTreeHeader,
+        header: &Header,
         index: ExtensionIndex,
     ) -> StringIndex {
         let extension_table = unsafe {
@@ -578,7 +583,7 @@ impl<'a> FileTreeReader<'a> {
         // |Header|Path hashes|Leaf path components|Path components|Extension table|String table|Strings|
         //        ^
         //        |
-        mem::size_of::<FileTreeHeader>() as _
+        mem::size_of::<Header>() as _
     }
 
     /// Calculates the size in bytes of the path hashes / lookup keys array given the lookup length from the header.
@@ -787,12 +792,12 @@ impl<'a> FileTreeReader<'a> {
 
 /// (Reverse) iterator over the (folder) file path components starting at `path_component`.
 struct FolderIter<'a, 'b> {
-    reader: &'a FileTreeReader<'b>,
+    reader: &'a Reader<'b>,
     path_component: Option<PathComponent>,
 }
 
 impl<'a, 'b> FolderIter<'a, 'b> {
-    fn new(reader: &'a FileTreeReader<'b>, path_component: Option<PathComponent>) -> Self {
+    fn new(reader: &'a Reader<'b>, path_component: Option<PathComponent>) -> Self {
         Self {
             reader,
             path_component,
@@ -839,7 +844,7 @@ mod tests {
     fn reader() {
         use minifilepath_macro::filepath;
 
-        let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
+        let mut writer = Writer::new(BuildSeaHasher::default());
 
         let paths = &[
             filepath!("foo/bar/baz"),
@@ -869,7 +874,7 @@ mod tests {
 
         let test_reader = |build_lookup: bool| {
             let reader = {
-                let mut reader = FileTreeReader::new(&data).unwrap();
+                let mut reader = Reader::new(&data, Some(version)).unwrap();
 
                 if build_lookup {
                     reader.build_lookup();

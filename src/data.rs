@@ -1,5 +1,5 @@
 use {
-    crate::util::*,
+    crate::*,
     static_assertions::const_assert,
     std::{
         io::{self, Write},
@@ -37,7 +37,7 @@ const FILE_TREE_HEADER_MAGIC: u32 = 0x736b6170; // `paks`, little endian.
 ///
 /// File tree data blob layout:
 ///
-/// | Header                    | `FileTreeHeader`              | 32b                           |
+/// | Header                    | `Header`              | 32b                           |
 /// | Path hashes               | `[PathHash]`                  | 8b * `lookup_len`             |
 /// | Leaf path components      | `[PackedLeafPathComponent]`   | 8b * `lookup_len`             |
 /// | Path components           | `[PackedPathComponent]`       | 8b * `path_components_len`    |
@@ -47,7 +47,7 @@ const FILE_TREE_HEADER_MAGIC: u32 = 0x736b6170; // `paks`, little endian.
 ///
 /// Fields are in whatever endianness we use; see `u32_from_bin()`.
 #[repr(C, packed)]
-pub(crate) struct FileTreeHeader {
+pub(crate) struct Header {
     /// Arbitrary magic value for a quick sanity check.
     magic: u32,
     /// Length of the path lookup in elements
@@ -61,16 +61,16 @@ pub(crate) struct FileTreeHeader {
     extension_table_len: ExtensionIndex,
     _padding: [ExtensionIndex; 3],
     /// Opaque user-provided "version" / user data information.
-    version: u64,
+    version: Version,
 }
 
-impl FileTreeHeader {
+impl Header {
     pub(crate) fn new(
         lookup_len: PathComponentIndex,
         path_components_len: PathComponentIndex,
         string_table_len: StringIndex,
         extension_table_len: ExtensionIndex,
-        version: u64,
+        version: Version,
     ) -> Self {
         Self {
             magic: FILE_TREE_HEADER_MAGIC,
@@ -105,7 +105,7 @@ impl FileTreeHeader {
         u32_from_bin(self.string_table_len)
     }
 
-    pub(crate) fn version(&self) -> u64 {
+    pub(crate) fn version(&self) -> Version {
         u64_from_bin(self.version)
     }
 

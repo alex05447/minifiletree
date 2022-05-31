@@ -24,9 +24,12 @@ pub use {error::*, reader::*, writer::*};
 /// for path [`components`](minifilepath::FilePath#method.components), root to leaf (skipping the separators).
 pub type PathHash = u64;
 
+/// Type alias for a user-provided "version" value stored to the file tree data blob when [`writing`](Writer::write) it.
+pub type Version = u64;
+
 use minifilepath::FilePathComponent;
 
-/// The file name component of the [`looked up`](FileTreeReader::lookup_iter) [`file path`](minifilepath::FilePath).
+/// The file name component of the [`looked up`](Reader::lookup_iter) [`file path`](minifilepath::FilePath).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FileName<'a> {
     /// File name path component with an extension (e.g. "bar.txt" in "foo/bar.txt", ".gitignore" in "foo/.gitignore").
@@ -40,7 +43,7 @@ pub enum FileName<'a> {
     NoExtension(FilePathComponent<'a>),
 }
 
-/// Result of a [`file path`](minifilepath::FilePath) [`look up`](FileTreeReader::lookup_iter) in the [`FileTreeReader`].
+/// Result of a [`file path`](minifilepath::FilePath) [`look up`](Reader::lookup_iter) in the [`Reader`].
 ///
 /// E.g.: `FilePathIter{ file_name: FileName::WithExtension{ extension: "txt", file_stem: "baz" }, file_path: ["bar", "foo"] }`
 /// for `"foo/bar/baz.txt"`.

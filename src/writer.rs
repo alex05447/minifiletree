@@ -61,11 +61,11 @@ type ExtensionTable = Vec<StringIndex>;
 /// Provides an API to append [`hashed`](PathHash) [`file paths`](FilePath) to a lookup data structure and store them space-efficiently.
 /// Deduplicates unique [`path component`](FilePathComponent) strings (including extensions) and file tree nodes.
 ///
-/// When finished, [`writes`](FileTreeWriter::write) the data to a binary blob which may then be saved, read by a [`FileTreeReader`]
+/// When finished, [`writes`](Writer::write) the data to a binary blob which may then be saved, read by a [`Reader`]
 /// and used to lookup the full file paths by their hashes.
 ///
 /// Uses a user-provided [`hasher builder`](std::hash::BuildHasher) to hash the path components.
-pub struct FileTreeWriter<H: BuildHasher> {
+pub struct Writer<H: BuildHasher> {
     /// User-provided hasher builder used to build the hasher which is used to hash the paths.
     hash_builder: H,
     /// Persistent lookup map from a full file path hash to its leaf path component.
@@ -110,18 +110,18 @@ pub struct FileTreeWriter<H: BuildHasher> {
     strings: String,
 }
 
-impl<H> FileTreeWriter<H>
+impl<H> Writer<H>
 where
     H: BuildHasher,
     // TODO: `Clone` requirement might be relaxed, but it would require hashing path strings in parallel more than once,
-    // bit I assume cloning any reasonable hasher is very cheap.
+    // but I assume cloning any reasonable hasher is very cheap.
     H::Hasher: Clone,
 {
     /// Create a new [`file tree writer`] with the provided [`hash_builder`].
     ///
     /// [`hash_builder`] is used to hash [`inserted`] paths and their subpaths / individual components.
     ///
-    /// [`file tree writer`]: struct.FileTreeWriter.html
+    /// [`file tree writer`]: struct.Writer.html
     /// [`inserted`]: #method.insert
     /// [`hash_builder`]: std::hash::BuildHasher
     pub fn new(hash_builder: H) -> Self {
@@ -138,17 +138,14 @@ where
         }
     }
 
-    /// Inserts the [`path`](FilePath) to a file into the writer and returns its [`hash`].
+    /// Inserts the [`path`](FilePath) to a file into the writer and returns its [`hash`](`PathHash`).
     ///
-    /// Returned [`hash`] is calculated by hashing each path component, root to leaf (excluding the separators),
+    /// Returned [`hash`](`PathHash`) is calculated by hashing each path component, root to leaf (excluding the separators),
     /// using the [`hash builder`](std::hash::BuildHasher) provided in the call to [`new`](#methods.new).
     ///
-    /// Full path hash collisions are treated as [`errors`].
-    ///
-    /// [`hash`]: type.PathHash.html
-    /// [`errors`]: enum.FileTreeWriterError.html#variant.PathHashCollision
-    pub fn insert<P: AsRef<FilePath>>(&mut self, path: P) -> Result<PathHash, FileTreeWriterError> {
-        use FileTreeWriterError::*;
+    /// Full path hash collisions are treated as [`errors`](WriterError::PathHashCollision).
+    pub fn insert<P: AsRef<FilePath>>(&mut self, path: P) -> Result<PathHash, WriterError> {
+        use WriterError::*;
 
         let path = path.as_ref();
 
@@ -189,9 +186,9 @@ where
                 .iter(lpc.path_component, lpc.extension)
                 .eq(file_path_rev_iter(path))
             {
-                return Err(FileTreeWriterError::PathAlreadyExists);
+                return Err(WriterError::PathAlreadyExists);
             } else {
-                return Err(FileTreeWriterError::PathHashCollision(self.path_buf(
+                return Err(WriterError::PathHashCollision(self.path_buf(
                     lpc.path_component,
                     lpc.extension,
                     lpc.string_len,
@@ -562,14 +559,14 @@ where
         Ok(path_hash)
     }
 
-    /// Consumes the [`writer`](FileTreeWriter) and serializes its data to the writer `w`.
+    /// Consumes the [`writer`](Writer) and serializes its data to the writer `w`.
     /// Stores the user-provided "version" into the header.
-    /// Produced data blob may then be used by the [`FileTreeReader`].
-    pub fn write<W: Write>(self, version: u64, w: &mut W) -> Result<usize, io::Error> {
+    /// Produced data blob may then be used by the [`Reader`].
+    pub fn write<W: Write>(self, version: Version, w: &mut W) -> Result<usize, io::Error> {
         let mut written = 0;
 
         // Header.
-        let header = FileTreeHeader::new(
+        let header = Header::new(
             self.path_lookup.len() as _,
             self.path_components.len() as _,
             self.string_table.len() as _,
@@ -584,7 +581,7 @@ where
         // Path lookup.
 
         // Get and sort the path hashes.
-        // NOTE - sorting is relied upon for binary search in `FileTreeReader::lookup_leaf_path_component()`.
+        // NOTE - sorting is relied upon for binary search in `Reader::lookup_leaf_path_component()`.
         let mut path_hashes = self.path_lookup.keys().cloned().collect::<Vec<_>>();
         path_hashes.sort();
 
@@ -646,9 +643,9 @@ where
         Ok(written as _)
     }
 
-    /// Consumes the [`writer`](FileTreeWriter) and serializes its data to the byte vec.
+    /// Consumes the [`writer`](Writer) and serializes its data to the byte vec.
     /// Stores the user-provided "version" into the header.
-    /// Produced data blob may then be used by the [`FileTreeReader`].
+    /// Produced data blob may then be used by the [`Reader`].
     pub fn write_to_vec(self, version: u64) -> Result<Vec<u8>, io::Error> {
         let mut result = Vec::new();
         self.write(version, &mut result)?;
@@ -1508,35 +1505,35 @@ mod tests {
     #[test]
     fn FolderAlreadyExistsAtFilePath() {
         {
-            let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
+            let mut writer = Writer::new(BuildSeaHasher::default());
             writer.insert(filepath!("foo/bar")).unwrap();
             assert_eq!(
                 writer.insert(filepath!("foo")).err().unwrap(),
-                FileTreeWriterError::FolderAlreadyExistsAtFilePath
+                WriterError::FolderAlreadyExistsAtFilePath
             );
         }
         {
-            let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
+            let mut writer = Writer::new(BuildSeaHasher::default());
             writer.insert(filepath!("foo/bar/baz")).unwrap();
             assert_eq!(
                 writer.insert(filepath!("foo/bar")).err().unwrap(),
-                FileTreeWriterError::FolderAlreadyExistsAtFilePath
+                WriterError::FolderAlreadyExistsAtFilePath
             );
         }
         {
-            let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
+            let mut writer = Writer::new(BuildSeaHasher::default());
             writer.insert(filepath!("foo/bar/baz.txt")).unwrap();
             assert_eq!(
                 writer.insert(filepath!("foo/bar")).err().unwrap(),
-                FileTreeWriterError::FolderAlreadyExistsAtFilePath
+                WriterError::FolderAlreadyExistsAtFilePath
             );
         }
         {
-            let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
+            let mut writer = Writer::new(BuildSeaHasher::default());
             writer.insert(filepath!("foo/bar.txt/baz")).unwrap();
             assert_eq!(
                 writer.insert(filepath!("foo/bar.txt")).err().unwrap(),
-                FileTreeWriterError::FolderAlreadyExistsAtFilePath
+                WriterError::FolderAlreadyExistsAtFilePath
             );
         }
     }
@@ -1544,43 +1541,43 @@ mod tests {
     #[test]
     fn FileAlreadyExistsAtFolderPath() {
         {
-            let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
+            let mut writer = Writer::new(BuildSeaHasher::default());
             writer.insert(filepath!("foo")).unwrap();
             assert_eq!(
                 writer.insert(filepath!("foo/bar")).err().unwrap(),
-                FileTreeWriterError::FileAlreadyExistsAtFolderPath(filepath!("foo").into())
+                WriterError::FileAlreadyExistsAtFolderPath(filepath!("foo").into())
             );
         }
         {
-            let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
+            let mut writer = Writer::new(BuildSeaHasher::default());
             writer.insert(filepath!("foo/bar")).unwrap();
             assert_eq!(
                 writer.insert(filepath!("foo/bar/baz")).err().unwrap(),
-                FileTreeWriterError::FileAlreadyExistsAtFolderPath(filepath!("foo/bar").into())
+                WriterError::FileAlreadyExistsAtFolderPath(filepath!("foo/bar").into())
             );
         }
         {
-            let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
+            let mut writer = Writer::new(BuildSeaHasher::default());
             writer.insert(filepath!("foo/bar.txt")).unwrap();
             assert_eq!(
                 writer.insert(filepath!("foo/bar.txt/baz")).err().unwrap(),
-                FileTreeWriterError::FileAlreadyExistsAtFolderPath(filepath!("foo/bar.txt").into())
+                WriterError::FileAlreadyExistsAtFolderPath(filepath!("foo/bar.txt").into())
             );
         }
 
         // But this works.
         {
-            let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
+            let mut writer = Writer::new(BuildSeaHasher::default());
             writer.insert(filepath!("foo/bar.txt/baz")).unwrap();
             writer.insert(filepath!("foo/bar.txt/bob")).unwrap();
         }
         {
-            let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
+            let mut writer = Writer::new(BuildSeaHasher::default());
             writer.insert(filepath!("foo/bar/txt")).unwrap();
             writer.insert(filepath!("foo/bar.txt/baz")).unwrap();
         }
         {
-            let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
+            let mut writer = Writer::new(BuildSeaHasher::default());
             writer.insert(filepath!("foo/bar/txt.cfg")).unwrap();
             writer.insert(filepath!("foo/bar.txt/baz")).unwrap();
         }
@@ -1647,19 +1644,19 @@ mod tests {
     #[test]
     fn PathAlreadyExists() {
         {
-            let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
+            let mut writer = Writer::new(BuildSeaHasher::default());
             writer.insert(filepath!("foo")).unwrap();
             assert_eq!(
                 writer.insert(filepath!("foo")).err().unwrap(),
-                FileTreeWriterError::PathAlreadyExists
+                WriterError::PathAlreadyExists
             );
         }
         {
-            let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
+            let mut writer = Writer::new(BuildSeaHasher::default());
             writer.insert(filepath!("foo/bar.txt")).unwrap();
             assert_eq!(
                 writer.insert(filepath!("foo/bar.txt")).err().unwrap(),
-                FileTreeWriterError::PathAlreadyExists
+                WriterError::PathAlreadyExists
             );
         }
     }
@@ -1667,24 +1664,24 @@ mod tests {
     #[test]
     fn PathHashCollision() {
         {
-            let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
+            let mut writer = Writer::new(BuildSeaHasher::default());
             writer.insert(filepath!("fo/o")).unwrap();
             assert!(
-                matches!(writer.insert(filepath!("f/oo")).err().unwrap(), FileTreeWriterError::PathHashCollision(x) if x.as_file_path() == filepath!("fo/o"))
+                matches!(writer.insert(filepath!("f/oo")).err().unwrap(), WriterError::PathHashCollision(x) if x.as_file_path() == filepath!("fo/o"))
             );
         }
         {
-            let mut writer = FileTreeWriter::new(BuildFNV1aHasher);
+            let mut writer = Writer::new(BuildFNV1aHasher);
             writer.insert(filepath!("cost/arring")).unwrap();
             assert!(
-                matches!(writer.insert(filepath!("liq/uid")).err().unwrap(), FileTreeWriterError::PathHashCollision(x) if x.as_file_path() == filepath!("cost/arring"))
+                matches!(writer.insert(filepath!("liq/uid")).err().unwrap(), WriterError::PathHashCollision(x) if x.as_file_path() == filepath!("cost/arring"))
             );
         }
         {
-            let mut writer = FileTreeWriter::new(BuildFNV1aHasher);
+            let mut writer = Writer::new(BuildFNV1aHasher);
             writer.insert(filepath!("altarag/es")).unwrap();
             assert!(
-                matches!(writer.insert(filepath!("zink/es")).err().unwrap(), FileTreeWriterError::PathHashCollision(x) if x.as_file_path() == filepath!("altarag/es"))
+                matches!(writer.insert(filepath!("zink/es")).err().unwrap(), WriterError::PathHashCollision(x) if x.as_file_path() == filepath!("altarag/es"))
             );
         }
 
@@ -1732,7 +1729,7 @@ mod tests {
             }
 
             {
-                let mut writer = FileTreeWriter::new(BuildMockHasher);
+                let mut writer = Writer::new(BuildMockHasher);
 
                 // [1, 2, 3] -> 3
                 let foo_bar_baz = writer.insert(filepath!("foo/bar/baz")).unwrap();
@@ -1746,7 +1743,7 @@ mod tests {
             }
 
             {
-                let mut writer = FileTreeWriter::new(BuildMockHasher);
+                let mut writer = Writer::new(BuildMockHasher);
 
                 // [1, 2, 3] -> 3
                 let foo_bar_baz = writer.insert(filepath!("foo/bar/baz")).unwrap();
@@ -1760,7 +1757,7 @@ mod tests {
             }
 
             {
-                let mut writer = FileTreeWriter::new(BuildMockHasher);
+                let mut writer = Writer::new(BuildMockHasher);
 
                 // [1, 2, 3] -> 3
                 let foo_bar_baz = writer.insert(filepath!("foo/bar/baz")).unwrap();
@@ -1774,7 +1771,7 @@ mod tests {
             }
 
             {
-                let mut writer = FileTreeWriter::new(BuildMockHasher);
+                let mut writer = Writer::new(BuildMockHasher);
 
                 // [1, 2] -> 2
                 let foo_bar = writer.insert(filepath!("foo/bar")).unwrap();
@@ -1783,7 +1780,7 @@ mod tests {
 
                 // [1, 2] -> 2
                 assert!(
-                    matches!(writer.insert(filepath!("foo/bill")).err().unwrap(), FileTreeWriterError::PathHashCollision(x) if x == FilePathBuf::new("foo/bar").unwrap())
+                    matches!(writer.insert(filepath!("foo/bill")).err().unwrap(), WriterError::PathHashCollision(x) if x == FilePathBuf::new("foo/bar").unwrap())
                 );
             }
         }
@@ -1791,7 +1788,7 @@ mod tests {
 
     #[test]
     fn writer() {
-        let mut writer = FileTreeWriter::new(BuildSeaHasher::default());
+        let mut writer = Writer::new(BuildSeaHasher::default());
 
         assert_eq!(writer.len(), 0);
 
@@ -1826,7 +1823,7 @@ mod tests {
 
     #[test]
     fn reuse_file_name_as_file_name() {
-        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+        let mut writer = Writer::new(BuildSeaHasher);
 
         {
             // Reuse file name "bar" as file name -> cannot happen, handled earlier by `PathAlreadyExists`
@@ -1847,7 +1844,7 @@ mod tests {
             }
             assert_eq!(
                 writer.insert(filepath!("foo/bar")).err().unwrap(),
-                FileTreeWriterError::PathAlreadyExists
+                WriterError::PathAlreadyExists
             );
 
             writer.clear();
@@ -1872,7 +1869,7 @@ mod tests {
             }
             assert_eq!(
                 writer.insert(filepath!("foo.bar/txt")).err().unwrap(),
-                FileTreeWriterError::PathAlreadyExists
+                WriterError::PathAlreadyExists
             );
 
             writer.clear();
@@ -1881,7 +1878,7 @@ mod tests {
 
     #[test]
     fn reuse_folder_name_as_file_name() {
-        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+        let mut writer = Writer::new(BuildSeaHasher);
 
         {
             // Reuse folder name "bar" as file name -> `FolderAlreadyExistsAtFilePath`
@@ -1904,7 +1901,7 @@ mod tests {
             }
             assert_eq!(
                 writer.insert(filepath!("foo/bar")).err().unwrap(),
-                FileTreeWriterError::FolderAlreadyExistsAtFilePath
+                WriterError::FolderAlreadyExistsAtFilePath
             );
 
             writer.clear();
@@ -1934,7 +1931,7 @@ mod tests {
             }
             assert_eq!(
                 writer.insert(filepath!("foo/bar.txt")).err().unwrap(),
-                FileTreeWriterError::FolderAlreadyExistsAtFilePath
+                WriterError::FolderAlreadyExistsAtFilePath
             );
 
             writer.clear();
@@ -1943,7 +1940,7 @@ mod tests {
 
     #[test]
     fn reuse_file_stem_as_file_name() {
-        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+        let mut writer = Writer::new(BuildSeaHasher);
 
         // Reuse file stem "bar" as file name.
 
@@ -1988,7 +1985,7 @@ mod tests {
 
     #[test]
     fn reuse_extension_as_file_name() {
-        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+        let mut writer = Writer::new(BuildSeaHasher);
 
         {
             // Reuse extension "bar" as file name.
@@ -2082,7 +2079,7 @@ mod tests {
 
     #[test]
     fn reuse_file_name_as_folder_name() {
-        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+        let mut writer = Writer::new(BuildSeaHasher);
 
         // Reuse file name "bar" as folder name -> `FileAlreadyExistsAtFolderPath("foo/bar")`
 
@@ -2102,13 +2099,13 @@ mod tests {
         }
         assert_eq!(
             writer.insert(filepath!("foo/bar/txt")).err().unwrap(),
-            FileTreeWriterError::FileAlreadyExistsAtFolderPath(filepath!("foo/bar").into())
+            WriterError::FileAlreadyExistsAtFolderPath(filepath!("foo/bar").into())
         );
     }
 
     #[test]
     fn reuse_folder_name_as_folder_name() {
-        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+        let mut writer = Writer::new(BuildSeaHasher);
 
         // Reuse folder names "foo", "bar" as folder names (the usual case).
 
@@ -2147,7 +2144,7 @@ mod tests {
 
     #[test]
     fn reuse_file_stem_as_folder_name() {
-        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+        let mut writer = Writer::new(BuildSeaHasher);
 
         // Reuse file stem "bar" as folder name (and extension "txt" as file name).
 
@@ -2196,7 +2193,7 @@ mod tests {
 
     #[test]
     fn reuse_extension_as_folder_name() {
-        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+        let mut writer = Writer::new(BuildSeaHasher);
 
         {
             // Reuse extension "bar" as folder name (and file stem "foo" as folder name).
@@ -2296,7 +2293,7 @@ mod tests {
 
     #[test]
     fn reuse_file_name_as_file_stem() {
-        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+        let mut writer = Writer::new(BuildSeaHasher);
 
         // Reuse file name "bar" as file stem.
 
@@ -2341,7 +2338,7 @@ mod tests {
 
     #[test]
     fn reuse_folder_name_as_file_stem() {
-        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+        let mut writer = Writer::new(BuildSeaHasher);
 
         // Reuse folder name "bar" as file stem (and file name "txt" as extension).
 
@@ -2390,7 +2387,7 @@ mod tests {
 
     #[test]
     fn reuse_file_stem_as_file_stem() {
-        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+        let mut writer = Writer::new(BuildSeaHasher);
 
         {
             // Reuse file stem "bar" as file stem.
@@ -2495,7 +2492,7 @@ mod tests {
 
     #[test]
     fn reuse_extension_as_file_stem() {
-        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+        let mut writer = Writer::new(BuildSeaHasher);
 
         // Reuse extension "txt" as file stem (and file stem "bar" as folder name).
 
@@ -2556,7 +2553,7 @@ mod tests {
 
     #[test]
     fn reuse_file_name_as_extension() {
-        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+        let mut writer = Writer::new(BuildSeaHasher);
 
         {
             // Reuse file name "bar" as extension (and folder name "foo" as file stem).
@@ -2652,7 +2649,7 @@ mod tests {
 
     #[test]
     fn reuse_folder_name_as_extension() {
-        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+        let mut writer = Writer::new(BuildSeaHasher);
 
         {
             // Reuse folder name "bar" as extension (and folder name "foo" as file stem).
@@ -2753,7 +2750,7 @@ mod tests {
 
     #[test]
     fn reuse_file_stem_as_extension() {
-        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+        let mut writer = Writer::new(BuildSeaHasher);
 
         // Reuse file stem "bar" as extension (and folder name "foo" as file stem).
 
@@ -2806,7 +2803,7 @@ mod tests {
 
     #[test]
     fn reuse_extension_as_extension() {
-        let mut writer = FileTreeWriter::new(BuildSeaHasher);
+        let mut writer = Writer::new(BuildSeaHasher);
 
         {
             // Reuse extension "txt" as extension -> cannot happen, handled earlier by `PathAlreadyExists`
@@ -2836,7 +2833,7 @@ mod tests {
             }
             assert_eq!(
                 writer.insert(filepath!("foo/bar.txt")).err().unwrap(),
-                FileTreeWriterError::PathAlreadyExists
+                WriterError::PathAlreadyExists
             );
 
             writer.clear();
@@ -2870,7 +2867,7 @@ mod tests {
             }
             assert_eq!(
                 writer.insert(filepath!("foo.bar/baz.txt")).err().unwrap(),
-                FileTreeWriterError::PathAlreadyExists
+                WriterError::PathAlreadyExists
             );
 
             writer.clear();

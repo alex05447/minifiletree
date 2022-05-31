@@ -3,7 +3,7 @@ use {
     std::{io::Write, iter::Iterator, mem},
 };
 
-pub(crate) fn u16_to_bin_bytes(val: u16) -> [u8; 2] {
+pub(crate) fn u16_to_bin_bytes(val: u16) -> [u8; mem::size_of::<u16>()] {
     if cfg!(feature = "big_endian") {
         u16::to_be_bytes(val)
     } else {

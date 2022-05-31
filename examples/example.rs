@@ -106,7 +106,9 @@ fn main() -> Result<(), io::Error> {
 
     // Serialize the written paths to the data blob.
 
-    let blob = writer.write_to_vec(7)?;
+    let version = 7;
+
+    let blob = writer.write_to_vec(version)?;
 
     println!(
         "Wrote {} paths, {} unique strings ({}b), {} components, {} extensions, {}b total:",
@@ -121,8 +123,8 @@ fn main() -> Result<(), io::Error> {
     // Read the blob, lookup the paths using the collected hashes.
 
     let reader = {
-        let mut reader =
-            FileTreeReader::new(&blob).ok_or(into_io_error("failed to read the filetree blob"))?;
+        let mut reader = Reader::new(&blob, Some(version))
+            .map_err(|_| into_io_error("failed to read the filetree blob"))?;
 
         reader.build_lookup();
 

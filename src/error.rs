@@ -1,4 +1,5 @@
 use {
+    crate::*,
     minifilepath::FilePathBuf,
     std::{
         error::Error,
@@ -6,9 +7,9 @@ use {
     },
 };
 
-/// An error returned by the [`file tree writer`](struct.FileTreeWriter.html).
+/// An error returned by the [`Writer`].
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum FileTreeWriterError {
+pub enum WriterError {
     /// A file was already inserted at this path.
     PathAlreadyExists,
     /// A folder was already inserted at this file path
@@ -27,11 +28,11 @@ pub enum FileTreeWriterError {
     PathHashCollision(FilePathBuf),
 }
 
-impl Error for FileTreeWriterError {}
+impl Error for WriterError {}
 
-impl Display for FileTreeWriterError {
+impl Display for WriterError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        use FileTreeWriterError::*;
+        use WriterError::*;
 
         match self {
             PathAlreadyExists => "a file was already inserted at this path".fmt(f),
@@ -44,6 +45,33 @@ impl Display for FileTreeWriterError {
                 "path hash collides with existing file path \"{}\"",
                 existing
             ),
+        }
+    }
+}
+
+/// An error returned by the [`Reader`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ReaderError {
+    /// The file tree data has an unexpected declared version.
+    /// Contains the found version value.
+    UnexpectedVersion(Version),
+    /// The file tree data blob is invalid or corrupted.
+    InvalidData,
+}
+
+impl Error for ReaderError {}
+
+impl Display for ReaderError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        use ReaderError::*;
+
+        match self {
+            UnexpectedVersion(version) => write!(
+                f,
+                "the file tree data has an unexpected version value ({})",
+                version
+            ),
+            InvalidData => "the file tree data blob is invalid or corrupted".fmt(f),
         }
     }
 }
