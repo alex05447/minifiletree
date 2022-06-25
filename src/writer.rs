@@ -6,6 +6,7 @@ use {
     minifilepath::*,
     minimultimap::*,
     ministr::*,
+    miniunchecked::*,
     std::{
         collections::HashMap,
         hash::{BuildHasher, Hash, Hasher},
@@ -464,7 +465,7 @@ where
                         extension_index.replace(extension_index_);
 
                         // Must succeed - extension path components must have a file stem parent path component.
-                        unsafe { debug_unwrap(parent_index) }
+                        unsafe { parent_index.unwrap_unchecked_dbg() }
                     }
                 }
             // We have not reused the current subpath.
@@ -484,7 +485,7 @@ where
                     extension_index.replace(extension_index_);
 
                     // Must succeed - extension path components must have a file stem parent path component.
-                    let file_stem_index = unsafe { debug_unwrap(parent_index) };
+                    let file_stem_index = unsafe { parent_index.unwrap_unchecked_dbg() };
 
                     self.subpath_lookup.insert(
                         subpath_hash,
@@ -523,7 +524,7 @@ where
                             }
                             PathComponentKind::Extension(_) => {
                                 // Extensions are handled above.
-                                debug_unreachable()
+                                unreachable_dbg!()
                             }
                         },
                     );
@@ -547,7 +548,7 @@ where
         // Update the leaf path components.
 
         // Must succeed if we got here, or we'd error out above.
-        let parent_index = unsafe { debug_unwrap(parent_index) };
+        let parent_index = unsafe { parent_index.unwrap_unchecked_dbg() };
 
         let _none = self.path_lookup.insert(
             path_hash,
@@ -596,7 +597,7 @@ where
         for lpc in path_hashes
             .iter()
             // Must succeed - all keys are contained in the map.
-            .map(|path_hash| *unsafe { debug_unwrap(self.path_lookup.get(path_hash)) })
+            .map(|path_hash| *unsafe { self.path_lookup.get(path_hash).unwrap_unchecked_dbg() })
         {
             written += lpc.write(w)?;
         }
@@ -1107,14 +1108,12 @@ fn get_path_component(
     path_components: &[PathComponent],
     index: PathComponentIndex,
 ) -> PathComponent {
-    debug_assert!((index as usize) < path_components.len());
-    *unsafe { path_components.get_unchecked(index as usize) }
+    *unsafe { path_components.get_unchecked_dbg(index as usize) }
 }
 
 /// The caller guarantees the extension `index` is valid.
 fn get_extension(extension_table: &[StringIndex], index: ExtensionIndex) -> StringIndex {
-    debug_assert!((index as usize) < extension_table.len());
-    *unsafe { extension_table.get_unchecked(index as usize) }
+    *unsafe { extension_table.get_unchecked_dbg(index as usize) }
 }
 
 /// The caller guarantees the string `index` is valid.
@@ -1123,8 +1122,7 @@ fn get_string<'s>(
     strings: &'s String,
     index: StringIndex,
 ) -> &'s str {
-    debug_assert!((index as usize) < string_table.len());
-    let string = unsafe { string_table.get_unchecked(index as usize) };
+    let string = unsafe { string_table.get_unchecked_dbg(index as usize) };
     debug_assert!((string.offset + string.len as StringOffset) <= strings.len() as StringOffset);
     unsafe {
         strings.get_unchecked(
@@ -1151,7 +1149,7 @@ fn file_path_rev_iter(
 ) -> FilePathIter<'_, impl Iterator<Item = FilePathComponent<'_>>> {
     let mut components = path.components().rev();
     // Empty paths are invalid.
-    let file_name = unsafe { debug_unwrap(components.next()) };
+    let file_name = unsafe { components.next().unwrap_unchecked_dbg() };
 
     FilePathIter {
         file_name: if let Some(FileStemAndExtension {

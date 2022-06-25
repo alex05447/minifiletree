@@ -130,19 +130,3 @@ pub(crate) fn build_path_string<'i, I>(
 
     debug_assert_eq!(offset, 0);
 }
-
-pub(crate) fn debug_unreachable() -> ! {
-    if cfg!(debug_assertions) {
-        unreachable!()
-    } else {
-        unsafe { std::hint::unreachable_unchecked() }
-    }
-}
-
-pub(crate) unsafe fn debug_unwrap<T>(val: Option<T>) -> T {
-    if let Some(val) = val {
-        val
-    } else {
-        debug_unreachable()
-    }
-}

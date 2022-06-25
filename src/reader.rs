@@ -1,7 +1,8 @@
 use {
     crate::*,
-    minifilepath::{is_valid_path_component, FilePathBuf, FilePathBuilder},
+    minifilepath::*,
     ministr::NonEmptyStr,
+    miniunchecked::*,
     std::{
         collections::{HashMap, HashSet},
         iter::Iterator,
@@ -371,9 +372,8 @@ impl<'a> Reader<'a> {
 
                 loop {
                     // Safe because we made sure all component indices are valid.
-                    debug_assert!((cur_path_component as usize) < path_components.len());
                     let path_component =
-                        unsafe { path_components.get_unchecked(cur_path_component as usize) }
+                        unsafe { path_components.get_unchecked_dbg(cur_path_component as usize) }
                             .unpack();
 
                     // Check the extension, if any.
@@ -384,9 +384,8 @@ impl<'a> Reader<'a> {
                             let extension_string_index =
                                 Self::extension_string_index_impl(data, header, extension);
                             // Safe because we made sure all extension string indices are valid.
-                            debug_assert!(extension_string_index < string_table_len);
                             let extension_string = unsafe {
-                                string_table.get_unchecked(extension_string_index as usize)
+                                string_table.get_unchecked_dbg(extension_string_index as usize)
                             }
                             .unpack();
                             actual_len += extension_string.len as FullStringLength;
@@ -453,8 +452,7 @@ impl<'a> Reader<'a> {
                 path_hashes.binary_search_by(|&path_hash| u64_from_bin(path_hash).cmp(&hash))
             {
                 let lpcs = unsafe { Self::leaf_path_components(self.data, lookup_len) };
-                debug_assert!(idx < lpcs.len());
-                Some(unsafe { lpcs.get_unchecked(idx) }.unpack())
+                Some(unsafe { lpcs.get_unchecked_dbg(idx) }.unpack())
             } else {
                 None
             }
@@ -521,8 +519,7 @@ impl<'a> Reader<'a> {
         let path_components = unsafe {
             Self::path_components(self.data, header.lookup_len(), header.path_components_len())
         };
-        debug_assert!(index < path_components.len() as _);
-        unsafe { path_components.get_unchecked(index as usize) }.unpack()
+        unsafe { path_components.get_unchecked_dbg(index as usize) }.unpack()
     }
 
     /// The caller guarantees the string `index` is valid.
@@ -539,8 +536,7 @@ impl<'a> Reader<'a> {
                     header.string_table_len(),
                 )
             };
-            debug_assert!((index as usize) < string_table.len());
-            unsafe { string_table.get_unchecked(index as usize) }.unpack()
+            unsafe { string_table.get_unchecked_dbg(index as usize) }.unpack()
         };
 
         unsafe { Self::string_slice(self.data, offset_and_len.offset, offset_and_len.len) }
@@ -574,8 +570,7 @@ impl<'a> Reader<'a> {
                 header.extension_table_len(),
             )
         };
-        debug_assert!((index as usize) < extension_table.len());
-        u32_from_bin(*unsafe { extension_table.get_unchecked(index as usize) })
+        u32_from_bin(*unsafe { extension_table.get_unchecked_dbg(index as usize) })
     }
 
     /// Calculates the offset in bytes from the start of the file tree data blob to the array of path hashes / lookup keys.
@@ -860,7 +855,7 @@ mod tests {
             filepath!("Bar"),
         ];
 
-        let version = 7;
+        let version: Version = 7;
 
         let hashes = paths
             .iter()
