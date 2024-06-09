@@ -42,12 +42,12 @@ type SubpathLookup = MultiMap<PathHash, SubpathComponent>;
 type StringLookup = MultiMap<PathHash, StringIndex>;
 
 /// Array of all unique path components added so far for folder / file name / file stem subpaths (but not for extensions).
-/// Index into by `PathLookup` and `SubpathLookup` entries.
+/// Indexed into by `PathLookup` and `SubpathLookup` entries.
 type PathComponents = Vec<PathComponent>;
 
 /// Array of all unique strings added so far.
 /// Indexed into by `PathComponents` entries.
-/// Used to index into the `String`.
+/// Used to index into the string section.
 type StringTable = Vec<InternedString>;
 
 /// Used for optimal extension string reuse / deduplication.
@@ -168,6 +168,7 @@ where
             let path_hash = hasher.finish();
 
             // Sanity check. Make sure the `Hash` implementation for the path hash actually behaves as we expect it to.
+            #[cfg(debug_assertions)]
             {
                 let mut _hasher = self.hash_builder.build_hasher();
                 path.hash(&mut _hasher);
@@ -193,7 +194,6 @@ where
                     lpc.path_component,
                     lpc.extension,
                     lpc.string_len,
-                    //lpc.is_extension,
                 )));
             }
         }
@@ -279,7 +279,7 @@ where
                 &self.string_table,
                 &self.strings,
                 subpath_hash,
-                path_component.as_str(),
+                path_component_str,
                 parent_index,
             );
 
@@ -487,7 +487,7 @@ where
                     // Must succeed - extension path components must have a file stem parent path component.
                     let file_stem_index = unsafe { parent_index.unwrap_unchecked_dbg() };
 
-                    self.subpath_lookup.insert(
+                    self.subpath_lookup.add(
                         subpath_hash,
                         SubpathComponent::new_extension(
                             file_stem_index,
@@ -510,7 +510,7 @@ where
                         parent_index,
                     );
 
-                    self.subpath_lookup.insert(
+                    self.subpath_lookup.add(
                         subpath_hash,
                         match path_component {
                             PathComponentKind::Folder(_) => {
@@ -524,7 +524,7 @@ where
                             }
                             PathComponentKind::Extension(_) => {
                                 // Extensions are handled above.
-                                unreachable_dbg!()
+                                unsafe { unreachable_dbg!() }
                             }
                         },
                     );
@@ -681,7 +681,7 @@ where
 
     #[cfg(test)]
     fn num_subpaths(&self) -> usize {
-        self.subpath_lookup.values().count()
+        self.subpath_lookup.multi_len()
     }
 
     /// Clears the writer, resetting all internal data structures without deallocating any storage.
@@ -1009,7 +1009,7 @@ where
         );
         let extension_index = extension_table.len() as ExtensionIndex;
         extension_table.push(extension_string_index);
-        extension_lookup.insert(extension_hash, extension_index);
+        extension_lookup.add(extension_hash, extension_index);
         extension_index
     }
 
@@ -1098,7 +1098,7 @@ where
         strings.push_str(string);
         let string_index = string_table.len() as _;
         string_table.push(offset_and_len);
-        string_lookup.insert(hash, string_index);
+        string_lookup.add(hash, string_index);
         string_index
     }
 }

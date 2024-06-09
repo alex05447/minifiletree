@@ -1,3 +1,4 @@
+//! # minifiletree
 //!
 //! A small helper Rust library to gather collections of UTF-8 relative file paths, associate them with unique hashes,
 //! and store them space-efficiently in a binary data blob;

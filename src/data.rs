@@ -37,7 +37,7 @@ const FILE_TREE_HEADER_MAGIC: u32 = 0x736b6170; // `paks`, little endian.
 ///
 /// File tree data blob layout:
 ///
-/// | Header                    | `Header`              | 32b                           |
+/// | Header                    | `Header`                      | 32b                           |
 /// | Path hashes               | `[PathHash]`                  | 8b * `lookup_len`             |
 /// | Leaf path components      | `[PackedLeafPathComponent]`   | 8b * `lookup_len`             |
 /// | Path components           | `[PackedPathComponent]`       | 8b * `path_components_len`    |
